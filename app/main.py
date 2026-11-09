@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import get_settings
-from app.routes import api_keys, auth, events
+from app.routes import api_keys, auth, events, github
 
 logger = logging.getLogger("jarvis")
 
@@ -31,6 +31,7 @@ if _frontend_origin:
 app.include_router(events.router)
 app.include_router(auth.router)
 app.include_router(api_keys.router)
+app.include_router(github.router)
 
 
 @app.get("/health")

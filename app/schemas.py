@@ -1,7 +1,7 @@
 """Response models for auth and API key endpoints."""
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -40,4 +40,28 @@ class ApiKeyStatusOut(BaseModel):
     key_prefix: Optional[str] = None
     created_at: Optional[datetime] = None
     last_used_at: Optional[datetime] = None
+
+
+class GitHubAppInstallationOut(BaseModel):
+    installation_id: int
+    account_id: int
+    account_login: str
+    account_type: str
+    repository_selection: Optional[str] = None
+    permissions: Dict[str, Any] = {}
+    suspended_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class GitHubIntegrationStatusOut(BaseModel):
+    connected: bool
+    installations: List[GitHubAppInstallationOut]
+
+
+class GitHubDisconnectOut(BaseModel):
+    status: str
+    message: str
+    installation_id: int
+
 

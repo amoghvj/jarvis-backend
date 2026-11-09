@@ -41,6 +41,12 @@ class Settings:
     session_secret: str
     post_login_redirect: bool
     samesite_override: Optional[str]
+    github_app_id: Optional[str] = None
+    github_app_client_id: Optional[str] = None
+    github_app_client_secret: Optional[str] = None
+    github_app_private_key: Optional[str] = None
+    github_app_slug: Optional[str] = None
+    github_app_callback_url: Optional[str] = None
 
     @property
     def frontend_origin(self) -> str:
@@ -102,5 +108,11 @@ def get_settings() -> Settings:
         post_login_redirect=os.environ.get("POST_LOGIN_REDIRECT", "false").strip().lower()
         in ("1", "true", "yes"),
         samesite_override=samesite,
+        github_app_id=os.environ.get("GITHUB_APP_ID") or None,
+        github_app_client_id=os.environ.get("GITHUB_APP_CLIENT_ID") or None,
+        github_app_client_secret=os.environ.get("GITHUB_APP_CLIENT_SECRET") or None,
+        github_app_private_key=os.environ.get("GITHUB_APP_PRIVATE_KEY") or None,
+        github_app_slug=os.environ.get("GITHUB_APP_SLUG") or None,
+        github_app_callback_url=os.environ.get("GITHUB_APP_CALLBACK_URL") or None,
     )
 

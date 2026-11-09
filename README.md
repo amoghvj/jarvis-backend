@@ -104,3 +104,49 @@ A batch is accepted or rejected as a whole. `last_used_at` is refreshed at most 
 ## Tests
 
 `pytest` runs against the configured `DATABASE_URL` but inside a single transaction that is always rolled back (including the `sessions` migration), so no data persists. GitHub is mocked. Tests are skipped if `DATABASE_URL` is unset.
+
+
+## GitHub App integration (installation linking, phases 1-3)
+
+Lets a logged-in user install the J.A.R.V.I.S. **GitHub App** and link the installation to their account. This is separate from the GitHub **OAuth App** used for login and uses its own `GITHUB_APP_*` credentials. No repository access (tree, files, search, commits) is implemented yet.
+
+### Flow
+1. Frontend sends the user to `GET /integrations/github/install` (needs the J.A.R.V.I.S. session cookie). A pending record is stored with only a SHA-256 hash of a random token, and the browser is redirected to `https://github.com/apps/<slug>/installations/new`.
+2. After installation GitHub redirects to `GET /integrations/github/setup?installation_id=…&setup_action=…`. The backend requires the session, validates the ID, stores a pending record (hashed random state, 10-minute expiry, single use) and redirects to GitHub's OAuth authorize URL. The state is also bound to the browser by a signed HttpOnly cookie.
+3. GitHub redirects to `GET /integrations/github/callback`. The backend consumes the state, exchanges the code with the App's client secret, fetches `/user`, and checks the GitHub numeric ID equals `users.github_id`. It then checks that the installation is in `/user/installations`, belongs to this App and is not suspended. It stores the link in a transaction and discards the user token.
+4. The browser is redirected to `FRONTEND_URL?github_app=connected&installation_id=…`, or `?github_app=error&reason=<code>`. Codes, tokens and keys never appear in the URL.
+
+`reason` values: `invalid_state`, `expired_state`, `replayed_state`, `cancelled`, `missing_params`, `identity_mismatch`, `installation_not_accessible`, `installation_suspended`, `installation_already_linked`, `github_oauth_error`.
+
+### Other endpoints
+- `GET /integrations/github/status` returns `{"connected": bool, "installations": [{installation_id, account_id, account_login, account_type, repository_selection, permissions, suspended_at, created_at, updated_at}]}` for the current user only.
+- `DELETE /integrations/github/installations/{installation_id}` (needs the `Origin` header, same CSRF rule as other mutations) removes **only the local link**. It does **not** uninstall the App from GitHub; users must do that in GitHub settings (Settings → Applications → Installed GitHub Apps). Another user's installation returns 404.
+
+An installation can be linked to only one J.A.R.V.I.S. user; a conflicting link is rejected.
+
+### Migration
+Run `migrations/002_create_github_app_installations.sql` in the Supabase SQL editor (additive, idempotent, RLS enabled, no policies). It creates `github_app_installations` and `github_app_pending_installations`.
+
+### GitHub App settings (github.com → Settings → Developer settings → GitHub Apps)
+- Setup URL: `https://jarvis-backend-kappa-six.vercel.app/integrations/github/setup`
+- Callback URL: `https://jarvis-backend-kappa-six.vercel.app/integrations/github/callback`
+- **Do not** enable "Request user authorization (OAuth) during installation"
+- Repository permissions: Metadata (read-only), Contents (read-only)
+- Webhooks: disabled
+- Generate a client secret and a private key (`.pem`)
+
+### Environment variables (local `.env` and Vercel)
+| Variable | Value |
+|---|---|
+| `GITHUB_APP_ID` | Numeric **App ID** (not the Client ID) |
+| `GITHUB_APP_CLIENT_ID` | App's Client ID (`Iv1.…`) |
+| `GITHUB_APP_CLIENT_SECRET` | App's client secret |
+| `GITHUB_APP_PRIVATE_KEY` | Full PEM. Multiline is fine; otherwise one line with `\n` for newlines |
+| `GITHUB_APP_SLUG` | The App's URL slug |
+| `GITHUB_APP_CALLBACK_URL` | The callback URL above |
+
+Never commit the key or secret, and never put them in frontend variables. Redeploy after changing Vercel variables.
+
+### Status of this feature
+- **Implemented and unit-tested** (mocked GitHub, real SQL in a rolled-back transaction): App JWT, installation-token creation, flow state, replay and expiry rejection, identity mismatch, ownership checks, duplicate and cross-user handling, status, disconnect.
+- **Not tested**: any real GitHub installation or OAuth round trip, the real GitHub API response shapes, behaviour on Vercel, and migration 002 against your database.

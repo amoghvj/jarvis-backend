@@ -1,9 +1,10 @@
 """All SQL lives here. Every statement is parameterised."""
 
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
 from uuid import UUID
 
 import psycopg
+from psycopg.types.json import Jsonb
 
 Row = Dict[str, Any]
 
@@ -137,4 +138,195 @@ def get_project_owners(conn: psycopg.Connection, project_ids: Iterable[str]) -> 
         (list(project_ids),),
     ).fetchall()
     return {r["project_id"]: r["user_id"] for r in rows}
+
+
+# --- user lookup -----------------------------------------------------------
+
+def get_user_by_id(conn: psycopg.Connection, user_id: UUID) -> Optional[Row]:
+    return conn.execute(
+        """
+        select id, github_id, github_username, email, avatar_url, created_at
+        from public.users
+        where id = %s
+        """,
+        (user_id,),
+    ).fetchone()
+
+
+# --- github app installations & pending flows ------------------------------
+
+def delete_expired_pending_installations(conn: psycopg.Connection, user_id: UUID) -> None:
+    conn.execute(
+        """
+        delete from public.github_app_pending_installations
+        where user_id = %s and (expires_at <= now() or consumed_at is not null)
+        """,
+        (user_id,),
+    )
+
+
+def create_pending_installation(
+    conn: psycopg.Connection,
+    *,
+    user_id: UUID,
+    state_hash: str,
+    ttl_seconds: int,
+    stage: str,
+    installation_id: Optional[int] = None,
+    setup_action: Optional[str] = None,
+) -> Row:
+    return conn.execute(
+        """
+        insert into public.github_app_pending_installations (
+            user_id, installation_id, setup_action, stage, state_hash, expires_at
+        )
+        values (%s, %s, %s, %s, %s, now() + make_interval(secs => %s))
+        returning id, user_id, installation_id, setup_action, stage, expires_at, created_at
+        """,
+        (user_id, installation_id, setup_action, stage, state_hash, ttl_seconds),
+    ).fetchone()
+
+
+def consume_install_flow_by_hash(
+    conn: psycopg.Connection, state_hash: str, user_id: UUID
+) -> Optional[Row]:
+    return conn.execute(
+        """
+        update public.github_app_pending_installations
+        set consumed_at = now()
+        where state_hash = %s
+          and user_id = %s
+          and stage = 'install'
+          and consumed_at is null
+          and expires_at > now()
+        returning id, user_id
+        """,
+        (state_hash, user_id),
+    ).fetchone()
+
+
+def get_pending_installation_by_hash(
+    conn: psycopg.Connection, state_hash: str
+) -> Optional[Row]:
+    return conn.execute(
+        """
+        select id, user_id, installation_id, setup_action, stage, consumed_at,
+               (expires_at <= now()) as is_expired
+        from public.github_app_pending_installations
+        where state_hash = %s
+        """,
+        (state_hash,),
+    ).fetchone()
+
+
+def consume_pending_installation(
+    conn: psycopg.Connection, pending_id: UUID
+) -> Optional[Row]:
+    return conn.execute(
+        """
+        update public.github_app_pending_installations
+        set consumed_at = now()
+        where id = %s
+          and stage = 'oauth'
+          and installation_id is not null
+          and consumed_at is null
+          and expires_at > now()
+        returning id, user_id, installation_id, setup_action
+        """,
+        (pending_id,),
+    ).fetchone()
+
+
+def upsert_github_app_installation(
+    conn: psycopg.Connection,
+    *,
+    user_id: UUID,
+    installation_id: int,
+    github_account_id: int,
+    github_account_login: str,
+    github_account_type: str,
+    repository_selection: Optional[str],
+    permissions: Dict[str, Any],
+    suspended_at: Optional[Any] = None,
+) -> Optional[Row]:
+    """Insert or update an installation owned by `user_id`.
+
+    Returns None if `installation_id` is already linked to a different J.A.R.V.I.S. user.
+    """
+    return conn.execute(
+        """
+        insert into public.github_app_installations (
+            user_id, installation_id, github_account_id, github_account_login,
+            github_account_type, repository_selection, permissions, suspended_at
+        )
+        values (%s, %s, %s, %s, %s, %s, %s, %s)
+        on conflict (installation_id) do update set
+            github_account_id    = excluded.github_account_id,
+            github_account_login = excluded.github_account_login,
+            github_account_type  = excluded.github_account_type,
+            repository_selection = excluded.repository_selection,
+            permissions          = excluded.permissions,
+            suspended_at         = excluded.suspended_at,
+            updated_at           = now()
+        where public.github_app_installations.user_id = excluded.user_id
+        returning id, user_id, installation_id, github_account_id, github_account_login,
+                  github_account_type, repository_selection, permissions, suspended_at,
+                  created_at, updated_at
+        """,
+        (
+            user_id,
+            installation_id,
+            github_account_id,
+            github_account_login,
+            github_account_type,
+            repository_selection,
+            Jsonb(permissions or {}),
+            suspended_at,
+        ),
+    ).fetchone()
+
+
+def list_github_app_installations_for_user(
+    conn: psycopg.Connection, user_id: UUID
+) -> List[Row]:
+    return conn.execute(
+        """
+        select id, user_id, installation_id, github_account_id, github_account_login,
+               github_account_type, repository_selection, permissions, suspended_at,
+               created_at, updated_at
+        from public.github_app_installations
+        where user_id = %s
+        order by created_at asc
+        """,
+        (user_id,),
+    ).fetchall()
+
+
+def get_github_app_installation_for_user(
+    conn: psycopg.Connection, user_id: UUID, installation_id: int
+) -> Optional[Row]:
+    return conn.execute(
+        """
+        select id, user_id, installation_id, github_account_id, github_account_login,
+               github_account_type, repository_selection, permissions, suspended_at,
+               created_at, updated_at
+        from public.github_app_installations
+        where user_id = %s and installation_id = %s
+        """,
+        (user_id, installation_id),
+    ).fetchone()
+
+
+def delete_github_app_installation(
+    conn: psycopg.Connection, user_id: UUID, installation_id: int
+) -> bool:
+    cur = conn.execute(
+        """
+        delete from public.github_app_installations
+        where user_id = %s and installation_id = %s
+        """,
+        (user_id, installation_id),
+    )
+    return cur.rowcount > 0
+
 

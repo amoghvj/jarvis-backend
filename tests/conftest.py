@@ -14,10 +14,27 @@ import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")  # supplies DATABASE_URL locally; real env wins
+
+_TEST_RSA_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+TEST_PRIVATE_KEY_PEM = _TEST_RSA_KEY.private_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PrivateFormat.PKCS8,
+    encryption_algorithm=serialization.NoEncryption(),
+).decode("utf-8")
+TEST_PUBLIC_KEY_PEM = (
+    _TEST_RSA_KEY.public_key()
+    .public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    .decode("utf-8")
+)
 
 # Deterministic fake OAuth/app config (DATABASE_URL is deliberately untouched).
 os.environ.update(
@@ -28,6 +45,12 @@ os.environ.update(
         "FRONTEND_URL": "https://frontend-test.example",
         "SESSION_SECRET": "x" * 48,
         "POST_LOGIN_REDIRECT": "false",
+        "GITHUB_APP_ID": "987654",
+        "GITHUB_APP_CLIENT_ID": "Iv1.testappclientid",
+        "GITHUB_APP_CLIENT_SECRET": "test-app-client-secret",
+        "GITHUB_APP_PRIVATE_KEY": TEST_PRIVATE_KEY_PEM,
+        "GITHUB_APP_SLUG": "jarvis-incident-app",
+        "GITHUB_APP_CALLBACK_URL": "https://jarvis-test.example/integrations/github/callback",
     }
 )
 os.environ.pop("COOKIE_SAMESITE", None)
@@ -46,7 +69,10 @@ from app.services import api_key_service, github_oauth  # noqa: E402
 
 FRONTEND = "https://frontend-test.example"
 BASE = "https://jarvis-test.example"
-MIGRATION = (ROOT / "migrations" / "001_create_sessions.sql").read_text()
+MIGRATIONS = [
+    (ROOT / "migrations" / "001_create_sessions.sql").read_text(),
+    (ROOT / "migrations" / "002_create_github_app_installations.sql").read_text(),
+]
 
 
 @pytest.fixture(autouse=True)
@@ -62,7 +88,8 @@ def db():
     if not url:
         pytest.skip("DATABASE_URL not configured")
     conn = psycopg.connect(url, row_factory=dict_row, prepare_threshold=None, autocommit=False)
-    conn.execute(MIGRATION)
+    for sql in MIGRATIONS:
+        conn.execute(sql)
     try:
         yield conn
     finally:
