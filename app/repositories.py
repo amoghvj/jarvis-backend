@@ -131,13 +131,73 @@ def touch_api_key(conn: psycopg.Connection, key_id: UUID) -> None:
 
 
 # --- projects --------------------------------------------------------------
+# `projects.project_id` is the external ID the SDK sends and is unique PER USER
+# (UNIQUE (user_id, project_id)); `projects.id` is the internal UUID used by every relationship
+# and every authorization decision.
 
-def get_project_owners(conn: psycopg.Connection, project_ids: Iterable[str]) -> Dict[str, UUID]:
+_PROJECT_COLUMNS = "id, user_id, project_id, name, created_at, updated_at"
+
+
+def get_user_projects_by_external_ids(
+    conn: psycopg.Connection, user_id: UUID, project_ids: Iterable[str]
+) -> Dict[str, UUID]:
+    """External project_id -> internal UUID, restricted to projects owned by `user_id`."""
     rows = conn.execute(
-        "select project_id, user_id from public.projects where project_id = any(%s)",
-        (list(project_ids),),
+        "select project_id, id from public.projects where user_id = %s and project_id = any(%s)",
+        (user_id, list(project_ids)),
     ).fetchall()
-    return {r["project_id"]: r["user_id"] for r in rows}
+    return {r["project_id"]: r["id"] for r in rows}
+
+
+def get_external_ids_owned_by_others(
+    conn: psycopg.Connection, user_id: UUID, project_ids: Iterable[str]
+) -> set:
+    rows = conn.execute(
+        "select distinct project_id from public.projects where user_id <> %s and project_id = any(%s)",
+        (user_id, list(project_ids)),
+    ).fetchall()
+    return {r["project_id"] for r in rows}
+
+
+def insert_project(conn: psycopg.Connection, user_id: UUID, project_id: str, name: str) -> Optional[Row]:
+    """Insert a project; None if this user already has that project_id (race-safe)."""
+    return conn.execute(
+        f"""
+        insert into public.projects (user_id, project_id, name)
+        values (%s, %s, %s)
+        on conflict (user_id, project_id) do nothing
+        returning {_PROJECT_COLUMNS}
+        """,
+        (user_id, project_id, name),
+    ).fetchone()
+
+
+def list_projects_for_user(conn: psycopg.Connection, user_id: UUID) -> List[Row]:
+    return conn.execute(
+        f"select {_PROJECT_COLUMNS} from public.projects where user_id = %s order by created_at, id",
+        (user_id,),
+    ).fetchall()
+
+
+def get_project_for_user(conn: psycopg.Connection, user_id: UUID, project_uuid: UUID) -> Optional[Row]:
+    """The project only if it belongs to `user_id` (the one authorization check for projects)."""
+    return conn.execute(
+        f"select {_PROJECT_COLUMNS} from public.projects where id = %s and user_id = %s",
+        (project_uuid, user_id),
+    ).fetchone()
+
+
+def update_project_name(
+    conn: psycopg.Connection, user_id: UUID, project_uuid: UUID, name: str
+) -> Optional[Row]:
+    return conn.execute(
+        f"""
+        update public.projects set name = %s, updated_at = now()
+        where id = %s and user_id = %s
+        returning {_PROJECT_COLUMNS}
+        """,
+        (name, project_uuid, user_id),
+    ).fetchone()
 
 
 # --- user lookup -----------------------------------------------------------

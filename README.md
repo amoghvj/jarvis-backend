@@ -150,3 +150,146 @@ Never commit the key or secret, and never put them in frontend variables. Redepl
 ### Status of this feature
 - **Implemented and unit-tested** (mocked GitHub, real SQL in a rolled-back transaction): App JWT, installation-token creation, flow state, replay and expiry rejection, identity mismatch, ownership checks, duplicate and cross-user handling, status, disconnect.
 - **Not tested**: any real GitHub installation or OAuth round trip, the real GitHub API response shapes, behaviour on Vercel, and migration 002 against your database.
+
+
+## Investigation tools: shared infrastructure and GitHub repository tools
+
+Reusable, read-only tools for the future investigation agent live in `app/tools/`. There is **no HTTP route, agent loop, LLM call or chat integration** yet; callers invoke tools in-process:
+
+```python
+from app.tools.executor import execute_tool
+from app.tools.schemas import ToolContext
+
+ctx = ToolContext(user_id=user["id"], conn=conn)   # user comes from a verified session, never from input
+result = execute_tool("get_file_contents",
+                      {"installation_id": 123, "owner": "acme", "repo": "webapp", "path": "src/app.py"}, ctx)
+```
+
+`app.tools.definitions.get_default_registry().describe()` returns machine-readable definitions (name, description, JSON input/output schemas, constraints).
+
+Every call returns the same shape: `{tool_name, status: "success"|"error", data, metadata: {duration_ms, source, github_requests}, error: {code, message, retryable} | null}`. Unknown fields in tool input are rejected (so `user_id` cannot be supplied), raw exceptions are logged server-side with credentials redacted, and results never contain tokens, stack traces or SQL.
+
+| Tool | Purpose | Notable bounds |
+|---|---|---|
+| `list_installations` | The user's linked installations (database only) | own installations only |
+| `list_repositories` | Repositories in an installation | `page`, `per_page` ≤ 100 |
+| `get_repository_metadata` | Identity, visibility, language, URLs, timestamps | |
+| `get_repository_tree` | Directory listing at a reference | `limit` ≤ 1000, `offset`, reports GitHub truncation |
+| `get_file_contents` | One UTF-8 text file | refuses files > 512 KB, binary and non-UTF-8 (never truncates) |
+| `search_repository` | Literal text search at a reference | ≤ 100 files, 2 MB, 50 results; reports `limits_hit` and `complete` |
+| `get_commit` | Author, date, message, parents, stats | no email addresses returned |
+| `get_commit_diff` | Changed files with patches | 20k chars per patch, 120k total, paginated |
+| `get_file_history` | Commits that touched a file | paginated |
+
+**Authorization.** Each repository tool first proves the installation is linked to the authenticated user (a foreign and a nonexistent installation look identical), rejects suspended installations, then confirms the repository is in the installation's repository list *before* using it. That last check matters because an installation token can read any public repository. The GitHub App's token service is reused; the OAuth login token is never used. Tokens never leave `app/tools/github/api.py`.
+
+**Versions.** `ref` accepts a branch, tag or commit SHA (7–40 hex characters are treated as a SHA). Without one, the default branch head is used and every result reports `reference` (resolved commit SHA, `default_branch_used`, and a warning that it may not match the code running during an incident). Content is always read at the resolved commit SHA.
+
+**Limitations.** `search_repository` deliberately does not use GitHub code search (it only indexes the default branch and cannot be pinned to a commit). Installations with more than 1,000 repositories fail closed. Tool time limits (20–28 s) may exceed your Vercel function duration, so raise `maxDuration` before exposing tools over HTTP. None of this has run against real GitHub yet.
+
+## Projects, telemetry persistence, incidents and telemetry tools
+
+### Applying migration 003 (manual; never run automatically)
+
+`migrations/003_project_telemetry_incidents.sql` is additive and idempotent. Statements that touch the
+existing `projects` / `incidents` tables are guarded, so a repeat run takes no locks and changes nothing.
+
+**Prerequisites:** `public.users`, `public.projects`, `public.incidents` (base schema), `public.sessions`
+(migration 001), and `public.github_app_installations` with `UNIQUE (installation_id)` (migration 002) must
+already exist. Run as the table owner (`postgres` in the Supabase SQL Editor).
+
+1. Open the Supabase dashboard, then **SQL Editor**, then **New query**.
+2. Paste the full contents of `migrations/003_project_telemetry_incidents.sql` and **Run** it (one transaction).
+3. Verify:
+   ```sql
+   select conname, pg_get_constraintdef(oid) from pg_constraint
+   where conrelid = 'public.projects'::regclass;          -- expect UNIQUE (user_id, project_id); no projects_project_id_key
+   select conname, pg_get_constraintdef(oid) from pg_constraint
+   where conrelid in ('public.incidents'::regclass, 'public.telemetry_events'::regclass)
+     and conname in ('incidents_status_check', 'telemetry_events_classification_check');  -- 2 rows
+   select table_name from information_schema.tables
+   where table_schema = 'public'
+     and table_name in ('telemetry_events', 'project_repositories', 'incident_history');   -- 3 rows
+   select relname, relrowsecurity from pg_class
+   where relname in ('telemetry_events', 'project_repositories', 'incident_history');      -- all true
+   ```
+4. Deploy the backend **after** the migration (the new code needs the new tables and columns).
+
+Rollback: there is no destructive step to undo. To go back to global uniqueness (only safe while no two users share
+a `project_id`): `alter table public.projects add constraint projects_project_id_key unique (project_id);`
+then drop `projects_user_id_project_id_key`.
+
+### Project API (session cookie; state changes also need a trusted `Origin`)
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /projects` | The caller's projects. |
+| `POST /projects` `{project_id, name?}` | Create. `project_id`: 3-64 chars, letters/digits/`.`/`_`/`-`, unique **per user** (409 on duplicate). The owner is always the session user; extra fields are rejected. No repository mapping is created. |
+| `GET /projects/{id}` | Details (`id` = internal UUID). Someone else's project is a 404. |
+| `PATCH /projects/{id}` `{name}` | Rename. |
+| `GET /projects/{id}/incidents?status=&limit=&offset=` | Incidents, newest activity first. |
+| `POST /projects/{id}/incidents/{incident_id}/status` `{status, note?}` | `open` -> `acknowledged`/`resolved`, `acknowledged` -> `resolved`/`open`, `resolved` -> `open`. Recorded in `incident_history`. Never automatic. |
+| `GET /projects/{id}/repositories` | Repositories discovered from telemetry with their verification status. |
+| `POST /projects/{id}/repositories/verify` | Re-check unverified repositories (for example after installing the GitHub App). |
+
+### Telemetry ingestion (`POST /v1/events`, API-key authenticated)
+
+* Events are persisted in `telemetry_events`, idempotent on `UNIQUE (project_id, event_id)`. A retried event
+  creates no second row, no second incident count and no second startup registration.
+* The response is unchanged (`status`, `message`, `received`) when every event was newly stored. If any event was a
+  duplicate or rejected, the response also carries `accepted`, `duplicates`, `rejected` and `results`
+  (per-event outcomes for the non-accepted ones); `status` is `partial` when something was rejected.
+* Each event is validated independently, so one bad event does not discard the rest. A batch with no valid event is a
+  422 listing why. Limits: 100 events per batch, 1,000,000 bytes per request, 100,000 bytes per event (413 / rejected).
+* The project is resolved from `application.project_id` **and the API key's owner**. Unknown project is 404, a project
+  that belongs to someone else is 403, and the whole batch is refused.
+* The whole batch (events plus incident grouping) is one transaction: a failure stores nothing and the SDK can retry.
+
+### Incident grouping
+
+Eligible events are non-`startup`, non-`normal_behaviour` events with severity `ERROR` or `CRITICAL`. The fingerprint is
+SHA-256 over project, service, environment, error type, lightly normalized message (whitespace and `0x...` addresses
+only), source file and source function. Timestamps, request/trace/span/instance IDs and line numbers are excluded.
+An existing `open`/`acknowledged` incident with the same fingerprint whose first/last-seen range is within the window
+(`INCIDENT_CORRELATION_WINDOW_SECONDS`, default 900) absorbs the event; otherwise a new incident is created. A
+transaction-scoped advisory lock per (project, fingerprint) makes this safe under concurrency. Severity only escalates.
+
+### Repository discovery and verification
+
+A `startup` event's `application.repository` registers an **unverified** row in `project_repositories`. It becomes
+`verified` only if the existing installation-authorization path finds that exact repository in one of the project
+owner's non-suspended GitHub App installations; `installation_id` is only ever set by that check. Verified rows are
+re-checked against the installation on every read, so suspension or uninstalling stops them being offered immediately.
+
+### Telemetry tools
+
+`get_incident`, `get_related_events`, `search_events`, `get_event_details`, `get_trace`, `get_service_context` and
+`get_incident_timeline` take an internal `project_id` that the shared executor injects from the trusted
+`ToolContext.project_id` after verifying the user owns it. It is omitted from the LLM-facing schema
+(`registry.describe()`; `describe(include_internal=True)` shows it) and rejected if a caller supplies it.
+
+### Running the tests
+
+The tests never touch the shared Supabase database by default. They start a throwaway local PostgreSQL (needs
+`initdb`/`pg_ctl` on `PATH`, `PG_BIN`, or a standard Windows install), or use `TEST_DATABASE_URL`. Set
+`JARVIS_TEST_USE_REMOTE_DB=1` to fall back to the legacy rolled-back-transaction mode against `DATABASE_URL`.
+
+### Event classification (jarvis-observe 0.1.1 contract)
+
+The canonical values are `normal_behaviour` and `abnormal_behaviour` (`telemetry_service.resolve_classification`).
+
+| Incoming `classification` | Stored in `telemetry_events.classification` |
+|---|---|
+| field absent, `type` is not `startup` (SDK 0.1.0) | `abnormal_behaviour` |
+| field absent, `type: startup` | `normal_behaviour` (a lifecycle event) |
+| `normal_behaviour` / `abnormal_behaviour`, any casing, surrounding whitespace ignored | the lower-case canonical value |
+| anything else: unknown or empty string, `null`, number, boolean, list, object | **event rejected** (per-event `rejected` result, or 422 if no event in the batch is valid); never stored, truncated or replaced |
+
+* The classification column is always one of the two values, so the `NOT NULL` constraint cannot fail.
+* The raw event is kept untouched in `payload`; only the column is normalized (for example `"NORMAL_BEHAVIOUR"` in the payload is
+  `normal_behaviour` in the column).
+* Valid but contradictory combinations are stored exactly as sent and are not reinterpreted: `startup` + `abnormal_behaviour` is stored
+  as `abnormal_behaviour`, and `ERROR` + `normal_behaviour` is stored as `normal_behaviour`. Eligibility is decided separately:
+  an event creates or joins an incident only if it is **not** `startup`, is classified `abnormal_behaviour` **and** has severity `ERROR` or
+  `CRITICAL` (an `error`-type event with no severity at all is still treated as ERROR). INFO, DEBUG and WARNING never create incidents,
+  even when classified `abnormal_behaviour`. The incident fingerprint does not include the classification.

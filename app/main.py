@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import get_settings
-from app.routes import api_keys, auth, events, github
+from app.routes import api_keys, auth, events, github, projects
 
 logger = logging.getLogger("jarvis")
 
@@ -24,7 +24,7 @@ if _frontend_origin:
         CORSMiddleware,
         allow_origins=[_frontend_origin],
         allow_credentials=True,
-        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Content-Type", "Authorization"],
     )
 
@@ -32,6 +32,7 @@ app.include_router(events.router)
 app.include_router(auth.router)
 app.include_router(api_keys.router)
 app.include_router(github.router)
+app.include_router(projects.router)
 
 
 @app.get("/health")

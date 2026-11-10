@@ -229,8 +229,12 @@ def test_install_initiates_flow_and_stores_only_hashed_token(client, github, db)
     assert cookie_val is not None
     raw_token = cookie_val.split(".")[0]
 
+    # Scope to this test's own user: the database may already hold real pending flows.
+    user_id = client.get("/auth/me").json()["id"]
     rows = db.execute(
-        "select state_hash, stage, installation_id from public.github_app_pending_installations"
+        "select state_hash, stage, installation_id from public.github_app_pending_installations "
+        "where user_id = %s",
+        (user_id,),
     ).fetchall()
     assert len(rows) == 1
     assert rows[0]["stage"] == "install"

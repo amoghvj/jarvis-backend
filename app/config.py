@@ -47,6 +47,8 @@ class Settings:
     github_app_private_key: Optional[str] = None
     github_app_slug: Optional[str] = None
     github_app_callback_url: Optional[str] = None
+    # Window used to group repeated errors into one incident (seconds).
+    incident_window_seconds: int = 900
 
     @property
     def frontend_origin(self) -> str:
@@ -83,6 +85,19 @@ class Settings:
         return {self.frontend_origin, self.backend_origin}
 
 
+def _bounded_int(name: str, default: int, low: int, high: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise RuntimeError(f"{name} must be an integer")
+    if not low <= value <= high:
+        raise RuntimeError(f"{name} must be between {low} and {high}")
+    return value
+
+
 @lru_cache
 def get_settings() -> Settings:
     missing = [name for name in REQUIRED_VARS if not os.environ.get(name)]
@@ -114,5 +129,6 @@ def get_settings() -> Settings:
         github_app_private_key=os.environ.get("GITHUB_APP_PRIVATE_KEY") or None,
         github_app_slug=os.environ.get("GITHUB_APP_SLUG") or None,
         github_app_callback_url=os.environ.get("GITHUB_APP_CALLBACK_URL") or None,
+        incident_window_seconds=_bounded_int("INCIDENT_CORRELATION_WINDOW_SECONDS", 900, 60, 86400),
     )
 

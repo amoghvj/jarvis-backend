@@ -8,7 +8,6 @@ GitHub's HTTP API is mocked; nothing contacts GitHub.
 """
 
 import os
-import re
 import secrets
 import uuid
 from pathlib import Path
@@ -69,10 +68,79 @@ from app.services import api_key_service, github_oauth  # noqa: E402
 
 FRONTEND = "https://frontend-test.example"
 BASE = "https://jarvis-test.example"
+BASE_SCHEMA = (ROOT / "tests" / "base_schema.sql").read_text()
 MIGRATIONS = [
     (ROOT / "migrations" / "001_create_sessions.sql").read_text(),
     (ROOT / "migrations" / "002_create_github_app_installations.sql").read_text(),
+    (ROOT / "migrations" / "003_project_telemetry_incidents.sql").read_text(),
 ]
+
+
+def _find_pg_bin():
+    """Directory holding initdb/pg_ctl (PG_BIN, PATH, or a standard Windows install)."""
+    candidates = []
+    if os.environ.get("PG_BIN"):
+        candidates.append(Path(os.environ["PG_BIN"]))
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        candidates.append(Path(entry))
+    candidates += sorted(Path("C:/Program Files/PostgreSQL").glob("*/bin"), reverse=True)
+    suffix = ".exe" if os.name == "nt" else ""
+    for directory in candidates:
+        if (directory / f"initdb{suffix}").exists() and (directory / f"pg_ctl{suffix}").exists():
+            return directory
+    return None
+
+
+@pytest.fixture(scope="session")
+def test_database():
+    """(url, is_throwaway) for the database the tests may use.
+
+    Priority: TEST_DATABASE_URL, then a throwaway local PostgreSQL started just for this run, and
+    only with JARVIS_TEST_USE_REMOTE_DB=1 the DATABASE_URL (legacy behaviour: shared database,
+    everything rolled back). Tests never touch the shared database by default.
+    """
+    explicit = os.environ.get("TEST_DATABASE_URL")
+    if explicit:
+        yield explicit, True
+        return
+    pg_bin = _find_pg_bin()
+    if pg_bin is None:
+        if os.environ.get("JARVIS_TEST_USE_REMOTE_DB") == "1" and os.environ.get("DATABASE_URL"):
+            yield os.environ["DATABASE_URL"], False
+            return
+        pytest.skip("No test database: install PostgreSQL (initdb on PATH or PG_BIN) or set TEST_DATABASE_URL")
+    import shutil
+    import socket
+    import subprocess
+    import tempfile
+
+    suffix = ".exe" if os.name == "nt" else ""
+    data_dir = tempfile.mkdtemp(prefix="jarvis-test-pg-")
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    subprocess.run(
+        [str(pg_bin / f"initdb{suffix}"), "-D", data_dir, "-U", "postgres", "--auth=trust", "-E", "UTF8"],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        [str(pg_bin / f"pg_ctl{suffix}"), "start", "-D", data_dir, "-w", "-s",
+         "-o", f"-p {port} -c fsync=off -c synchronous_commit=off -c listen_addresses=127.0.0.1 "
+               "-c max_connections=60", "-l", str(Path(data_dir) / "server.log")],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+        # Pipes would be inherited by the long-running server and block this call on Windows.
+    )
+    url = f"postgresql://postgres@127.0.0.1:{port}/postgres"
+    try:
+        with psycopg.connect(url, autocommit=True) as setup:
+            setup.execute(BASE_SCHEMA)
+            for sql in MIGRATIONS:
+                setup.execute(sql)
+        yield url, True
+    finally:
+        subprocess.run([str(pg_bin / f"pg_ctl{suffix}"), "stop", "-D", data_dir, "-m", "immediate", "-s"],
+                       capture_output=True)
+        shutil.rmtree(data_dir, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)
@@ -83,10 +151,10 @@ def _settings():
 
 
 @pytest.fixture
-def db():
-    url = os.environ.get("DATABASE_URL")
+def db(test_database):
+    url, _ = test_database
     if not url:
-        pytest.skip("DATABASE_URL not configured")
+        pytest.skip("No test database configured")
     conn = psycopg.connect(url, row_factory=dict_row, prepare_threshold=None, autocommit=False)
     for sql in MIGRATIONS:
         conn.execute(sql)

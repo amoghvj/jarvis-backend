@@ -61,8 +61,26 @@ class EventBatch(_Base):
     events: List[Event] = Field(..., min_length=1)
 
 
+class EventOutcome(BaseModel):
+    index: int
+    event_id: Optional[str] = None
+    status: str  # duplicate | rejected
+    error: Optional[str] = None
+
+
 class EventsResponse(BaseModel):
+    """Ingestion result.
+
+    `status`, `message` and `received` are the original contract (`received` is the number of
+    events in the request). `accepted`, `duplicates`, `rejected` and `results` appear only when
+    something other than a plain all-new success happened, so existing SDK responses are unchanged.
+    """
+
     status: str
     message: str
     received: int
+    accepted: Optional[int] = None
+    duplicates: Optional[int] = None
+    rejected: Optional[int] = None
+    results: Optional[List[EventOutcome]] = None
 
