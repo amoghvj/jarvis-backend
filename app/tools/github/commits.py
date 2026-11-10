@@ -228,14 +228,24 @@ def get_file_history(ctx: ToolContext, inp: FileHistoryInput) -> FileHistoryOutp
 TOOLS = [
     ToolDefinition(
         name="get_commit",
-        description="Get a commit's author, date, message, parents and change statistics.",
+        description=(
+            "Purpose: Fetch metadata for one commit sha in owner/repo (author, committer, timestamps, commit message, parent SHAs, addition/deletion stats). "
+            "When to use: After get_file_history or when inspecting a specific commit SHA to see who authored it, when, and why. "
+            "When not to use: To see the actual line-by-line code changes in that commit, use get_commit_diff. "
+            "Scope & limitations: Requires a commit SHA (7-40 hex chars) under installation_id."
+        ),
         input_model=CommitInput,
         output_model=CommitOutput,
         handler=get_commit,
     ),
     ToolDefinition(
         name="get_commit_diff",
-        description="Get a commit's changed files with bounded patches; reports truncation and omitted patches.",
+        description=(
+            "Purpose: Retrieve changed files and unified diff patches for a commit sha in owner/repo (optionally filtered to a single path). "
+            "When to use: When checking whether a recent commit introduced a regression or modified a suspect file/function. "
+            "When not to use: Do not use before identifying a relevant commit SHA (use get_file_history first to find commits touching a file). "
+            "Scope & limitations: Bounded file/patch sizes; explicitly flags truncated patches."
+        ),
         input_model=CommitDiffInput,
         output_model=CommitDiffOutput,
         handler=get_commit_diff,
@@ -243,7 +253,12 @@ TOOLS = [
     ),
     ToolDefinition(
         name="get_file_history",
-        description="List commits that changed a file, newest first, walking back from a reference (paginated).",
+        description=(
+            "Purpose: List commits that modified a specific file path in owner/repo walking backward from ref (newest first, paginated). "
+            "When to use: When investigating recent code changes to a file implicated by a stack trace or incident. "
+            "When not to use: Do not use to read current file contents (use get_file_contents) or diff a known commit SHA (use get_commit_diff). "
+            "Scope & limitations: Returns commit SHAs, authors, dates, and messages; follow up with get_commit_diff on suspect SHAs."
+        ),
         input_model=FileHistoryInput,
         output_model=FileHistoryOutput,
         handler=get_file_history,

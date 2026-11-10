@@ -135,9 +135,12 @@ TOOLS = [
     ToolDefinition(
         name="get_service_context",
         description=(
-            "Get what telemetry shows about one service: environments, instances and runtimes seen, last "
-            "startup event, recent event and error frequency, recent incidents and its verified repositories. "
-            "No deployment information is available or inferred."
+            "Purpose: Summarize telemetry intelligence for one service_id (optionally filtered by environment): "
+            "active environments, instances, language runtimes, last startup event, recent event/error rates over window_hours, "
+            "recent incidents, and verified GitHub repositories mapped to the project/service. "
+            "When to use: When investigating service-level health, runtime versions, recent restarts, or finding which GitHub repository backs a service. "
+            "When not to use: If investigating a specific incident_id first, call get_incident before get_service_context. "
+            "Scope & limitations: Automatically scoped to the active project; derived strictly from telemetry (startup events reflect SDK init, not CI/CD deployments)."
         ),
         input_model=ServiceContextInput, output_model=ServiceContextOutput, handler=get_service_context,
         source="database", constraints=TELEMETRY_CONSTRAINTS, context_inputs=("project_id",),

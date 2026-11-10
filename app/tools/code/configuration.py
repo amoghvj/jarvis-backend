@@ -466,10 +466,10 @@ TOOLS = [
     ToolDefinition(
         name="inspect_configuration",
         description=(
-            "Inspect allowlisted configuration files (.env.example/.sample/.template, pyproject.toml, "
-            "requirements*.txt, package.json, tsconfig*.json, vite/next/webpack config, vercel.json) at a pinned "
-            "commit: keys with line numbers, dependency declarations and environment-variable references. "
-            "Never retrieves .env or key files; credential-like values are redacted."
+            "Purpose: Inspect allowlisted configuration and manifest files (.env.example/.sample/.template, pyproject.toml, requirements*.txt, package.json, tsconfig*.json, vite/next/webpack configs, vercel.json) in owner/repo at ref, plus environment variable references in source files. "
+            "When to use: When checking dependency versions, runtime/build settings, or required environment variables and where they are referenced in code. "
+            "When not to use: Do not use to read arbitrary source code files (use get_file_contents). "
+            "Scope & limitations: Never reads secret-bearing files (.env, private keys); redacts credential-like values automatically."
         ),
         input_model=InspectConfigurationInput,
         output_model=InspectConfigurationOutput,

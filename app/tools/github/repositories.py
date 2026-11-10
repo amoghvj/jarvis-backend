@@ -277,7 +277,12 @@ def get_repository_tree(ctx: ToolContext, inp: RepositoryTreeInput) -> Repositor
 TOOLS = [
     ToolDefinition(
         name="list_installations",
-        description="List the GitHub App installations linked to the authenticated J.A.R.V.I.S. user.",
+        description=(
+            "Purpose: List GitHub App installations linked to the authenticated J.A.R.V.I.S. user (installation_id, account_login, account_type, suspended_at). "
+            "When to use: When no repository or installation_id is returned by get_incident/get_service_context and you need to discover available GitHub installations. "
+            "When not to use: Skip if get_incident or get_service_context already provided the verified installation_id, owner, and repo. "
+            "Scope & limitations: Scoped to the current user's linked installations."
+        ),
         input_model=ListInstallationsInput,
         output_model=ListInstallationsOutput,
         handler=list_installations,
@@ -285,21 +290,36 @@ TOOLS = [
     ),
     ToolDefinition(
         name="list_repositories",
-        description="List repositories accessible through one of the user's GitHub App installations (paginated).",
+        description=(
+            "Purpose: List GitHub repositories accessible under a specific installation_id (name, full_name, owner, default_branch, private, html_url). "
+            "When to use: After list_installations when discovering which repositories belong to an installation. "
+            "When not to use: Skip if owner and repo are already known from incident/service repository_context. "
+            "Scope & limitations: Paginated (page, per_page); requires a valid installation_id owned by the user."
+        ),
         input_model=ListRepositoriesInput,
         output_model=ListRepositoriesOutput,
         handler=list_repositories,
     ),
     ToolDefinition(
         name="get_repository_metadata",
-        description="Get identity, visibility, language, URLs and timestamps for a repository in an installation.",
+        description=(
+            "Purpose: Fetch repository metadata (default_branch, visibility, primary language, topics, timestamps, URLs) for owner/repo under installation_id. "
+            "When to use: When you need the repository's default_branch, language, or general metadata before browsing code. "
+            "When not to use: Do not use to list files (use get_repository_tree) or read file contents (use get_file_contents). "
+            "Scope & limitations: Read-only GitHub API lookup."
+        ),
         input_model=RepositoryInput,
         output_model=RepositoryMetadataOutput,
         handler=get_repository_metadata,
     ),
     ToolDefinition(
         name="get_repository_tree",
-        description="List files and directories at a reference. Bounded; reports truncation and the exact reference used.",
+        description=(
+            "Purpose: List files and directories in owner/repo at a branch, tag, or commit ref (optionally under path and recursive). "
+            "When to use: When exploring repository directory structure or locating files when exact paths are unknown. "
+            "When not to use: Do not use if you already know the exact file path (use get_file_contents) or are searching for text (use search_repository) or a symbol definition (use find_symbol). "
+            "Scope & limitations: Bounded and paginated (offset, limit); reports exact resolved commit SHA and any truncation."
+        ),
         input_model=RepositoryTreeInput,
         output_model=RepositoryTreeOutput,
         handler=get_repository_tree,

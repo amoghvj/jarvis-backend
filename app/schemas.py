@@ -144,3 +144,101 @@ class ProjectRepositoryOut(BaseModel):
 
 class ProjectRepositoryListOut(BaseModel):
     repositories: List[ProjectRepositoryOut]
+
+
+# ============================================================================
+# Conversational Investigation Agent Schemas
+# ============================================================================
+
+
+class ConversationCreateIn(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    title: Optional[str] = None
+
+
+class ConversationSummaryOut(BaseModel):
+    id: UUID
+    project_id: UUID
+    title: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    last_message_at: datetime
+
+
+class ConversationListOut(BaseModel):
+    conversations: List[ConversationSummaryOut]
+    limit: int
+    offset: int
+    has_more: bool
+
+
+class ConversationMessageOut(BaseModel):
+    id: UUID
+    conversation_id: UUID
+    sequence_number: int
+    role: str
+    message_type: str
+    content: Optional[str] = None
+    metadata: Dict[str, Any] = {}
+    run_id: Optional[UUID] = None
+    created_at: datetime
+
+
+class ConversationDetailOut(BaseModel):
+    conversation: ConversationSummaryOut
+    messages: List[ConversationMessageOut]
+    limit: int
+    offset: int
+    has_more: bool
+
+
+class ConversationDeleteOut(BaseModel):
+    status: str = "deleted"
+    conversation_id: UUID
+
+
+class ConversationMessageCreateIn(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    content: str
+    client_request_id: Optional[str] = None
+
+
+class ConversationMessageSubmitOut(BaseModel):
+    run_id: UUID
+    conversation_id: UUID
+    user_message_id: UUID
+    status: str
+    deduplicated: bool = False
+    created_at: datetime
+
+
+class AgentRunStepOut(BaseModel):
+    id: UUID
+    run_id: UUID
+    step_number: int
+    step_type: str
+    tool_name: Optional[str] = None
+    status: str
+    input_summary: Dict[str, Any] = {}
+    output_summary: Dict[str, Any] = {}
+    created_at: datetime
+
+
+class AgentRunStatusOut(BaseModel):
+    run_id: UUID
+    conversation_id: UUID
+    user_message_id: UUID
+    status: str
+    error_message: Optional[str] = None
+    attempt_count: int = 0
+    max_attempts: int = 3
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    updated_at: datetime
+    steps: List[AgentRunStepOut]
+    latest_step_number: int
+    assistant_messages: List[ConversationMessageOut] = []
+

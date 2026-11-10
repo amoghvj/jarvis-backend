@@ -350,9 +350,10 @@ TOOLS = [
     ToolDefinition(
         name="find_references",
         description=(
-            "Find references to a symbol (identifiers, imports, calls, attribute accesses) across a repository "
-            "at one pinned commit. Each match states whether it is bound to the definition through an import "
-            "or only matches by name; optional plain-text matches are labelled textual. Not semantic resolution."
+            "Purpose: Find AST references (imports, exports, calls, attribute accesses, assignments, identifiers) to symbol_name across owner/repo at ref, with import-binding resolution confidence per match. "
+            "When to use: When tracing where a symbol, constant, class, or function is imported, referenced, or passed as a value across the codebase. "
+            "When not to use: If you only want direct call sites of a callable and their enclosing caller functions, prefer find_callers. "
+            "Scope & limitations: Static AST + import analysis (not runtime/typechecker semantic resolution); bounded by max_files/max_results."
         ),
         input_model=FindReferencesInput,
         output_model=FindReferencesOutput,
@@ -362,8 +363,10 @@ TOOLS = [
     ToolDefinition(
         name="find_callers",
         description=(
-            "Find direct, statically visible call sites of a function, method or class and the function that "
-            "contains each call, with a resolution class per result. Does not detect dynamic or indirect calls."
+            "Purpose: Find direct, statically visible call sites of a function, method, or class constructor (symbol_name, optionally narrowed by target_path) and identify the enclosing caller function/method for each call. "
+            "When to use: When tracing upstream callers that invoke a failing function or method to understand how bad inputs or state reach it. "
+            "When not to use: For non-call references (imports, callbacks passed as values, constants), use find_references. "
+            "Scope & limitations: Detects static direct calls only; does not trace dynamic dispatch, reflection, or DI frameworks."
         ),
         input_model=FindCallersInput,
         output_model=FindCallersOutput,

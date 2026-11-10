@@ -287,10 +287,10 @@ TOOLS = [
     ToolDefinition(
         name="analyze_dependencies",
         description=(
-            "Build the import dependency graph for one file or a bounded set of repository files at a pinned "
-            "commit (Python import/from; JS/TS ES imports, re-exports, require, dynamic import with literal "
-            "specifiers). Separates internal repository dependencies from external, stdlib/builtin and "
-            "unresolved ones. Nothing is installed or executed."
+            "Purpose: Build the static import dependency graph for one file (path) or a directory prefix in owner/repo at ref, separating internal repository modules, external packages, stdlib/builtins, and unresolved imports. "
+            "When to use: When investigating module coupling, broken imports, external package usage, or downstream/upstream file dependencies. "
+            "When not to use: To find files related to a specific file/symbol by ranked relevance, use find_related_files; for package manifest versions, use inspect_configuration. "
+            "Scope & limitations: Static AST import parsing for Python/JS/TS; never installs or executes code."
         ),
         input_model=DependencyInput,
         output_model=DependencyOutput,
@@ -300,9 +300,10 @@ TOOLS = [
     ToolDefinition(
         name="find_related_files",
         description=(
-            "Rank files related to a source file (and optionally a symbol in it) using import/export "
-            "relationships and symbol references; directory proximity and test naming are included only as "
-            "clearly-labelled weak hints, each with an explanation."
+            "Purpose: Rank repository files most related to a target source file path (and optional symbol_name) based on direct imports, importers, symbol references, test naming, and directory proximity. "
+            "When to use: When starting from a suspect file in a stack trace and discovering adjacent modules, callers, or tests to inspect next. "
+            "When not to use: If you already know the exact symbol call graph you want, use find_callers or find_references directly. "
+            "Scope & limitations: Heuristic ranking with explicit evidence strength labels (strong for imports, weak hint for directory/naming)."
         ),
         input_model=RelatedFilesInput,
         output_model=RelatedFilesOutput,

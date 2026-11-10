@@ -291,9 +291,10 @@ TOOLS = [
     ToolDefinition(
         name="inspect_tests",
         description=(
-            "Find tests relevant to a source file or symbol (pytest/unittest; Jest/Vitest/Mocha-style) at a "
-            "pinned commit: test files and cases, imported names, direct invocations, assertions and locations. "
-            "Distinguishes importing a module from demonstrably calling a function. Never executes tests."
+            "Purpose: Locate static test files and test cases (pytest/unittest, Jest/Vitest/Mocha/Playwright) relevant to a target source file path and optional symbol_name at ref, reporting imports, direct calls, and assertions. "
+            "When to use: When checking existing test coverage, expected behavior, edge-case assertions, or missing test cases for a suspect file or function. "
+            "When not to use: Do not expect this tool to execute tests; it performs static AST inspection only. "
+            "Scope & limitations: Distinguishes direct symbol invocation from module-only imports; dynamic fixtures/monkeypatches are not followed."
         ),
         input_model=InspectTestsInput,
         output_model=InspectTestsOutput,

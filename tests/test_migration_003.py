@@ -12,7 +12,7 @@ from psycopg.rows import dict_row
 
 from tests.conftest import BASE_SCHEMA, MIGRATIONS
 
-M001, M002, M003 = MIGRATIONS
+M001, M002, M003 = MIGRATIONS[:3]
 NEW_TABLES = ("telemetry_events", "project_repositories", "incident_history")
 NEW_INCIDENT_COLUMNS = {"fingerprint", "service_id", "environment", "first_seen_at", "last_seen_at",
                         "event_count", "acknowledged_at", "resolved_at"}

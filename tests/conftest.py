@@ -73,6 +73,7 @@ MIGRATIONS = [
     (ROOT / "migrations" / "001_create_sessions.sql").read_text(),
     (ROOT / "migrations" / "002_create_github_app_installations.sql").read_text(),
     (ROOT / "migrations" / "003_project_telemetry_incidents.sql").read_text(),
+    (ROOT / "migrations" / "004_agent_conversations_runs.sql").read_text(),
 ]
 
 

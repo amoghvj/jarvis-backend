@@ -267,9 +267,12 @@ TOOLS = [
     ToolDefinition(
         name="get_incident",
         description=(
-            "Get an incident's details together with its project context and the verified repositories "
-            "associated with the project and affected service (an explicit empty list if none). "
-            "Optionally includes the incident's most recent events."
+            "Purpose: Fetch full details for one incident (title, status, severity, fingerprint, service_id, "
+            "environment, timestamps, event_count), its verified project/service GitHub repositories "
+            "(with installation_id, owner, repo), and optionally its most recent telemetry events. "
+            "When to use: Primary starting point whenever an incident_id (UUID) is known. "
+            "When not to use: Do not use for broad event filtering without an incident_id (use search_events). "
+            "Scope & limitations: Automatically scoped to the active project context; read-only."
         ),
         input_model=GetIncidentInput, output_model=GetIncidentOutput, handler=get_incident,
         source="database", constraints=TELEMETRY_CONSTRAINTS, context_inputs=("project_id",),
@@ -277,8 +280,11 @@ TOOLS = [
     ToolDefinition(
         name="get_related_events",
         description=(
-            "List events grouped into an incident, or into every incident that shares its fingerprint, with "
-            "optional time-range and minimum-severity filters. Newest first, paginated."
+            "Purpose: List persisted telemetry events belonging to an incident (scope='incident') or all "
+            "incidents sharing its fingerprint (scope='fingerprint'), filtered by time range and min_severity. "
+            "When to use: After get_incident when you need more event occurrences, stack locations, or cross-incident pattern history. "
+            "When not to use: Do not use for full stack trace/payload of one event (use get_event_details) or arbitrary service searches (use search_events). "
+            "Scope & limitations: Newest first, paginated; automatically scoped to the active project."
         ),
         input_model=RelatedEventsInput, output_model=RelatedEventsOutput, handler=get_related_events,
         source="database", constraints=TELEMETRY_CONSTRAINTS, context_inputs=("project_id",),
@@ -286,9 +292,11 @@ TOOLS = [
     ToolDefinition(
         name="get_incident_timeline",
         description=(
-            "Chronological timeline of an incident: recorded telemetry events interleaved with recorded "
-            "lifecycle transitions (created, severity escalations, status changes), plus a clearly labelled "
-            "derived summary."
+            "Purpose: Build a chronological timeline of an incident interleaving recorded telemetry events "
+            "(event_time) with recorded lifecycle transitions (created, severity_escalated, status changes at recorded_time) and a derived summary. "
+            "When to use: When analyzing how an incident evolved, escalated, or recurred over time. "
+            "When not to use: Do not use just to fetch incident metadata or repository links (use get_incident). "
+            "Scope & limitations: Automatically scoped to the active project; derived_summary is computed, not a raw event."
         ),
         input_model=TimelineInput, output_model=TimelineOutput, handler=get_incident_timeline,
         source="database", constraints=TELEMETRY_CONSTRAINTS, context_inputs=("project_id",),

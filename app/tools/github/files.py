@@ -307,8 +307,10 @@ TOOLS = [
     ToolDefinition(
         name="get_file_contents",
         description=(
-            "Read one text file at a reference. Files over 512 KB, binary files and non-UTF-8 files are "
-            "refused rather than truncated."
+            "Purpose: Read the full UTF-8 text content of a known file path in owner/repo at ref (branch, tag, or commit SHA). "
+            "When to use: When you know the repository file path (e.g., from a stack trace source_file or tree/search result) and want to inspect its code. "
+            "When not to use: For unknown file paths use search_repository or get_repository_tree; for extracting just one function with its imports/context, get_function_context is more targeted. "
+            "Scope & limitations: Refuses binary, non-UTF-8, or >512 KB files rather than silently truncating."
         ),
         input_model=FileContentsInput,
         output_model=FileContentsOutput,
@@ -317,8 +319,10 @@ TOOLS = [
     ToolDefinition(
         name="search_repository",
         description=(
-            "Bounded literal text search at one reference using the git tree and blobs. Reports exactly which "
-            "limits were hit and whether results are complete."
+            "Purpose: Perform a bounded literal substring search across text files in owner/repo at an exact ref (optionally filtered by path_prefix and language). "
+            "When to use: When searching for error messages, string literals, route paths, or identifiers across unknown files. "
+            "When not to use: If you already know the file path, use get_file_contents; if searching for AST function/class definitions or callers, prefer find_symbol, find_references, or find_callers. "
+            "Scope & limitations: Literal match (not regex); walks pinned tree/blobs and explicitly reports complete=False and limits_hit if bounds are reached."
         ),
         input_model=SearchRepositoryInput,
         output_model=SearchRepositoryOutput,

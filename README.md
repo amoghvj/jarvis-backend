@@ -293,3 +293,46 @@ The canonical values are `normal_behaviour` and `abnormal_behaviour` (`telemetry
   an event creates or joins an incident only if it is **not** `startup`, is classified `abnormal_behaviour` **and** has severity `ERROR` or
   `CRITICAL` (an `error`-type event with no severity at all is still treated as ERROR). INFO, DEBUG and WARNING never create incidents,
   even when classified `abnormal_behaviour`. The incident fingerprint does not include the classification.
+
+## Conversational Investigation Agent (Migration 004)
+
+### Applying migration 004 (manual; never run automatically)
+
+`migrations/004_agent_conversations_runs.sql` is additive and idempotent. It creates `public.conversations`,
+`public.conversation_messages`, `public.agent_runs`, and `public.agent_run_steps` with RLS enabled and cascading
+deletes from conversations to their messages, runs, and run steps (leaving projects, incidents, telemetry events,
+and repositories untouched).
+
+1. Open the Supabase **SQL Editor** -> **New query**.
+2. Paste `migrations/004_agent_conversations_runs.sql` and click **Run**.
+
+### Environment variables (`app/config.py`)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GROQ_API_KEY` | *(required for agent execution)* | Groq API key (backend-only) |
+| `GROQ_ENDPOINT` | `https://api.groq.com/openai/v1` | OpenAI-compatible Groq base URL |
+| `GROQ_MODEL` | `qwen/qwen3.8-27b` | Configured model identifier |
+| `AGENT_MAX_ITERATIONS` | `8` (`1..25`) | Max model/tool loop iterations per run |
+| `AGENT_RUN_TIMEOUT_SECONDS` | `120` (`10..600`) | Overall run execution timeout |
+| `AGENT_LEASE_SECONDS` | `45` (`10..300`) | Worker claim lease TTL |
+| `AGENT_MAX_TOOL_RESULT_CHARS` | `16000` (`2000..100000`) | Max serialized JSON characters per tool result |
+| `AGENT_MAX_RETRIES` | `2` (`0..5`) | Max recoverable retries |
+| `AGENT_MODEL_TIMEOUT_SECONDS` | `45` (`5..180`) | Per-request LLM HTTP timeout |
+
+### Conversation & Run APIs (session cookie; mutations require trusted `Origin`)
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /projects/{project_uuid}/conversations` | List conversations for the authenticated user and project (`limit`, `offset`). |
+| `POST /projects/{project_uuid}/conversations` `{title?}` | Create a new conversation in the project (`201 Created`). |
+| `GET /projects/{project_uuid}/conversations/{conversation_id}` | Get conversation metadata and visible transcript messages (`limit`, `offset`). |
+| `DELETE /projects/{project_uuid}/conversations/{conversation_id}` | Delete conversation and cascade to its messages, runs, and run steps. |
+| `POST /projects/{project_uuid}/conversations/{conversation_id}/messages` `{content, client_request_id?}` | Persist user message, queue an agent run (`202 Accepted`), and trigger background execution. |
+| `GET /projects/{project_uuid}/conversations/{conversation_id}/runs/{run_id}?after_step=0` | Poll run status, timestamps, incremental `steps`, `latest_step_number`, and completed `assistant_messages`. |
+
+To run a dedicated persistent worker process alongside the API server:
+```bash
+python -m scripts.run_agent_worker
+```
+

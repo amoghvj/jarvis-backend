@@ -15,15 +15,20 @@ from psycopg.rows import dict_row
 from app.config import get_settings
 
 
-def get_db() -> Iterator[psycopg.Connection]:
-    """FastAPI dependency yielding a request-scoped connection."""
-    conn = psycopg.connect(
+def open_connection() -> psycopg.Connection:
+    """Open a short-lived PostgreSQL connection compatible with the Supabase Transaction Pooler."""
+    return psycopg.connect(
         get_settings().database_url,
         row_factory=dict_row,
         autocommit=True,
         prepare_threshold=None,
         connect_timeout=10,
     )
+
+
+def get_db() -> Iterator[psycopg.Connection]:
+    """FastAPI dependency yielding a request-scoped connection."""
+    conn = open_connection()
     try:
         yield conn
     finally:

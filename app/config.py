@@ -49,6 +49,16 @@ class Settings:
     github_app_callback_url: Optional[str] = None
     # Window used to group repeated errors into one incident (seconds).
     incident_window_seconds: int = 900
+    # Conversational Investigation Agent (Groq OpenAI-compatible API)
+    groq_api_key: Optional[str] = None
+    groq_endpoint: str = "https://api.groq.com/openai/v1"
+    groq_model: str = "qwen/qwen3.8-27b"
+    agent_max_iterations: int = 8
+    agent_run_timeout_seconds: int = 120
+    agent_lease_seconds: int = 45
+    agent_max_tool_result_chars: int = 16000
+    agent_max_retries: int = 2
+    agent_model_timeout_seconds: int = 45
 
     @property
     def frontend_origin(self) -> str:
@@ -130,5 +140,14 @@ def get_settings() -> Settings:
         github_app_slug=os.environ.get("GITHUB_APP_SLUG") or None,
         github_app_callback_url=os.environ.get("GITHUB_APP_CALLBACK_URL") or None,
         incident_window_seconds=_bounded_int("INCIDENT_CORRELATION_WINDOW_SECONDS", 900, 60, 86400),
+        groq_api_key=(os.environ.get("GROQ_API_KEY") or "").strip() or None,
+        groq_endpoint=(os.environ.get("GROQ_ENDPOINT") or "https://api.groq.com/openai/v1").strip().rstrip("/"),
+        groq_model=(os.environ.get("GROQ_MODEL") or "qwen/qwen3.8-27b").strip(),
+        agent_max_iterations=_bounded_int("AGENT_MAX_ITERATIONS", 8, 1, 25),
+        agent_run_timeout_seconds=_bounded_int("AGENT_RUN_TIMEOUT_SECONDS", 120, 10, 600),
+        agent_lease_seconds=_bounded_int("AGENT_LEASE_SECONDS", 45, 10, 300),
+        agent_max_tool_result_chars=_bounded_int("AGENT_MAX_TOOL_RESULT_CHARS", 16000, 2000, 100000),
+        agent_max_retries=_bounded_int("AGENT_MAX_RETRIES", 2, 0, 5),
+        agent_model_timeout_seconds=_bounded_int("AGENT_MODEL_TIMEOUT_SECONDS", 45, 5, 180),
     )
 

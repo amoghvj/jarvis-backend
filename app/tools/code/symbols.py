@@ -254,9 +254,10 @@ TOOLS = [
     ToolDefinition(
         name="find_symbol",
         description=(
-            "Locate definitions of functions, classes, methods, variables/constants (and TS interfaces, types, "
-            "enums) by exact name in Python, JavaScript, TypeScript, JSX and TSX at one pinned commit. Multiple "
-            "definitions are all returned and flagged ambiguous. Parser-based; bounded; reports completeness."
+            "Purpose: Locate AST definitions of functions, classes, methods, variables/constants, and TS interfaces/types/enums by exact symbol_name in Python/JS/TS/JSX/TSX at ref. "
+            "When to use: When you know a function, class, or method name (e.g. from a stack trace or log) and need the file path, line range, and signature where it is defined. "
+            "When not to use: If you already want the full source body and imports of a function, use get_function_context; for arbitrary string search, use search_repository. "
+            "Scope & limitations: Static AST parser (no code execution); flags ambiguous=True if multiple definitions match."
         ),
         input_model=FindSymbolInput,
         output_model=FindSymbolOutput,
@@ -266,8 +267,10 @@ TOOLS = [
     ToolDefinition(
         name="get_function_context",
         description=(
-            "Return the full source of one function or method (never truncated; refused if over the size limit) "
-            "with signature, decorators, containing class, the imports it uses and related same-file definitions."
+            "Purpose: Extract the complete, untruncated source code of one function or method (symbol_name, optionally scoped to path or Class.method) along with its signature, decorators, containing class, used imports, and related same-file definitions. "
+            "When to use: When inspecting the implementation of a specific function/method implicated in an incident or call chain. "
+            "When not to use: Do not use for whole files or non-function config files (use get_file_contents); if multiple functions share the name, pass path or 'Class.method'. "
+            "Scope & limitations: Refuses functions exceeding max_source_bytes rather than truncating; Python/JS/TS/JSX/TSX only."
         ),
         input_model=FunctionContextInput,
         output_model=FunctionContextOutput,

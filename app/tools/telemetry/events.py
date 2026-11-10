@@ -247,8 +247,12 @@ TOOLS = [
     ToolDefinition(
         name="search_events",
         description=(
-            "Search persisted telemetry events by service, environment, severity, type, message text, error "
-            "type, source location, trace ID, request ID and time range. Newest first, paginated."
+            "Purpose: Search and filter persisted project telemetry events by service_id, environment, severity, "
+            "event_type, classification, message substring, error_type, source_file, source_function, trace_id, "
+            "request_id, incident_id, and time range (since/until). "
+            "When to use: When exploring project telemetry broadly, finding recent errors/logs, or when no incident_id is given. "
+            "When not to use: If you already have an incident_id, start with get_incident; if you have a trace_id, prefer get_trace. "
+            "Scope & limitations: Returns newest-first event summaries (paginated); automatically scoped to the active project."
         ),
         input_model=SearchEventsInput, output_model=SearchEventsOutput, handler=search_events,
         source="database", constraints=TELEMETRY_CONSTRAINTS, context_inputs=("project_id",),
@@ -256,8 +260,12 @@ TOOLS = [
     ToolDefinition(
         name="get_event_details",
         description=(
-            "Get one complete persisted event: stack trace, source details, associated incident and the "
-            "original payload with secrets redacted."
+            "Purpose: Retrieve one complete persisted telemetry event by event_uuid (internal UUID) or event_id "
+            "(SDK event ID), including full redacted stack_trace, source file/function/line, runtime, attributes, "
+            "redacted raw payload, and linked incident summary. "
+            "When to use: When an event summary from get_incident, get_related_events, or search_events needs stack trace or attribute inspection. "
+            "When not to use: Do not call until you have a specific event_uuid or event_id. "
+            "Scope & limitations: Automatically scoped to the active project; stack traces over 16 KB are marked truncated."
         ),
         input_model=EventDetailsInput, output_model=EventDetailsOutput, handler=get_event_details,
         source="database", constraints=TELEMETRY_CONSTRAINTS, context_inputs=("project_id",),
@@ -265,8 +273,11 @@ TOOLS = [
     ToolDefinition(
         name="get_trace",
         description=(
-            "Get the events sharing a trace ID in chronological order, with the span IDs and services seen. "
-            "Events are grouped by span_id only; parent/child span relationships are not available or inferred."
+            "Purpose: Retrieve all persisted telemetry events sharing a trace_id in chronological order, along "
+            "with span_id groupings and affected services. "
+            "When to use: When an event or incident includes a trace_id and you need to inspect cross-step or cross-service execution flow. "
+            "When not to use: Do not use without a known trace_id (use search_events or get_related_events instead). "
+            "Scope & limitations: Groups by trace_id and span_id only; parent-child span hierarchy is not recorded or inferred; automatically scoped to the active project."
         ),
         input_model=GetTraceInput, output_model=GetTraceOutput, handler=get_trace,
         source="database", constraints=TELEMETRY_CONSTRAINTS, context_inputs=("project_id",),
