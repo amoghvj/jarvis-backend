@@ -54,8 +54,10 @@ class Settings:
     groq_endpoint: str = "https://api.groq.com/openai/v1"
     groq_model: str = "qwen/qwen3.8-27b"
     agent_max_iterations: int = 8
-    agent_run_timeout_seconds: int = 120
-    agent_lease_seconds: int = 45
+    agent_run_timeout_seconds: int = 900
+    agent_invocation_timeout_seconds: int = 240
+    agent_invocation_reserve_seconds: int = 8
+    agent_lease_seconds: int = 90
     agent_max_tool_result_chars: int = 16000
     agent_max_retries: int = 2
     agent_model_timeout_seconds: int = 45
@@ -144,8 +146,10 @@ def get_settings() -> Settings:
         groq_endpoint=(os.environ.get("GROQ_ENDPOINT") or "https://api.groq.com/openai/v1").strip().rstrip("/"),
         groq_model=(os.environ.get("GROQ_MODEL") or "qwen/qwen3.8-27b").strip(),
         agent_max_iterations=_bounded_int("AGENT_MAX_ITERATIONS", 8, 1, 25),
-        agent_run_timeout_seconds=_bounded_int("AGENT_RUN_TIMEOUT_SECONDS", 120, 10, 600),
-        agent_lease_seconds=_bounded_int("AGENT_LEASE_SECONDS", 45, 10, 300),
+        agent_run_timeout_seconds=_bounded_int("AGENT_RUN_TIMEOUT_SECONDS", 900, 10, 7200),
+        agent_invocation_timeout_seconds=_bounded_int("AGENT_INVOCATION_TIMEOUT_SECONDS", 240, 5, 290),
+        agent_invocation_reserve_seconds=_bounded_int("AGENT_INVOCATION_RESERVE_SECONDS", 8, 1, 30),
+        agent_lease_seconds=_bounded_int("AGENT_LEASE_SECONDS", 90, 15, 300),
         agent_max_tool_result_chars=_bounded_int("AGENT_MAX_TOOL_RESULT_CHARS", 16000, 2000, 100000),
         agent_max_retries=_bounded_int("AGENT_MAX_RETRIES", 2, 0, 5),
         agent_model_timeout_seconds=_bounded_int("AGENT_MODEL_TIMEOUT_SECONDS", 45, 5, 180),

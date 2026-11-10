@@ -33,6 +33,7 @@ class HistoryManager(ABC):
         conversation_id: UUID,
         *,
         active_run_id: Optional[UUID] = None,
+        worker_id: Optional[str] = None,
     ) -> List[BaseMessage]:
         """Return the ordered sequence of LangChain messages for model invocation."""
 
@@ -45,6 +46,8 @@ class HistoryManager(ABC):
         *,
         run_id: Optional[UUID] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        worker_id: Optional[str] = None,
+        fencing_run_id: Optional[UUID] = None,
     ) -> Dict[str, Any]:
         """Persist a LangChain message as a framework-independent database record."""
 
@@ -190,6 +193,7 @@ class FullHistoryManager(HistoryManager):
         conversation_id: UUID,
         rows: List[Dict[str, Any]],
         active_run_id: Optional[UUID] = None,
+        worker_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Ensure every persisted assistant tool_call message from non-active turns has matching ToolMessages."""
         if not rows:
@@ -242,6 +246,8 @@ class FullHistoryManager(HistoryManager):
                         tool_name=call["name"] or "unknown_tool",
                         metadata={"repaired_dangling_tool_call": True},
                         run_id=r.get("run_id"),
+                        expected_worker_id=worker_id if active_run_id is not None else None,
+                        fencing_run_id=active_run_id if worker_id is not None else None,
                     )
                     existing_tool_result_ids.add(cid)
                     repaired = True
@@ -259,6 +265,7 @@ class FullHistoryManager(HistoryManager):
         conversation_id: UUID,
         *,
         active_run_id: Optional[UUID] = None,
+        worker_id: Optional[str] = None,
     ) -> List[BaseMessage]:
         rows = repositories_agent.list_all_messages_for_history(
             conn,
@@ -269,6 +276,7 @@ class FullHistoryManager(HistoryManager):
             conversation_id,
             rows,
             active_run_id=active_run_id,
+            worker_id=worker_id,
         )
         return [row_to_langchain_message(r) for r in rows]
 
@@ -280,6 +288,8 @@ class FullHistoryManager(HistoryManager):
         *,
         run_id: Optional[UUID] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        worker_id: Optional[str] = None,
+        fencing_run_id: Optional[UUID] = None,
     ) -> Dict[str, Any]:
         meta = dict(metadata or {})
         if isinstance(message, HumanMessage):
@@ -292,6 +302,8 @@ class FullHistoryManager(HistoryManager):
                 metadata=meta,
                 run_id=run_id,
                 set_title_if_empty=True,
+                expected_worker_id=worker_id,
+                fencing_run_id=fencing_run_id,
             )
 
         if isinstance(message, AIMessage):
@@ -316,6 +328,8 @@ class FullHistoryManager(HistoryManager):
                     tool_calls=stored_calls,
                     metadata=meta,
                     run_id=run_id,
+                    expected_worker_id=worker_id,
+                    fencing_run_id=fencing_run_id,
                 )
             return repositories_agent.append_conversation_message(
                 conn,
@@ -325,6 +339,8 @@ class FullHistoryManager(HistoryManager):
                 content=str(message.content or ""),
                 metadata=meta,
                 run_id=run_id,
+                expected_worker_id=worker_id,
+                fencing_run_id=fencing_run_id,
             )
 
         if isinstance(message, ToolMessage):
@@ -339,6 +355,8 @@ class FullHistoryManager(HistoryManager):
                 tool_name=str(tool_name),
                 metadata=meta,
                 run_id=run_id,
+                expected_worker_id=worker_id,
+                fencing_run_id=fencing_run_id,
             )
 
         raise TypeError(f"Unsupported LangChain message type: {type(message).__name__}")

@@ -148,8 +148,12 @@ def test_migration_004_check_and_unique_constraints(db):
         with db.transaction():
             db.execute(
                 """
-                INSERT INTO public.agent_runs (conversation_id, user_message_id, status)
-                VALUES (%s, %s, 'running')
+                INSERT INTO public.agent_runs (
+                    conversation_id, user_message_id, status, worker_id, lease_expires_at
+                )
+                VALUES (
+                    %s, %s, 'running', 'w-unique-check', clock_timestamp() + interval '60 seconds'
+                )
                 """,
                 (conv["id"], msg["id"]),
             )

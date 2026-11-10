@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 
 from app import repositories, repositories_agent
-from app.agent.worker import trigger_background_run
+from app.agent.worker import claim_and_execute_run
 from app.config import Settings, get_settings
 from app.database import get_db
 from app.dependencies.authentication import get_current_user, require_trusted_origin
@@ -118,6 +118,43 @@ def create_project_conversation(
     return ConversationSummaryOut(**row)
 
 
+def _build_run_status_out(
+    db,
+    *,
+    conversation_id: UUID,
+    run: dict,
+    after_step: int = 0,
+    limit: int = 100,
+) -> AgentRunStatusOut:
+    steps, latest_step = repositories_agent.list_run_steps(
+        db,
+        run_id=run["id"],
+        after_step=after_step,
+        limit=limit,
+    )
+    assistant_messages = repositories_agent.list_assistant_messages_for_run(
+        db,
+        conversation_id=conversation_id,
+        run_id=run["id"],
+    )
+    return AgentRunStatusOut(
+        run_id=run["id"],
+        conversation_id=run["conversation_id"],
+        user_message_id=run["user_message_id"],
+        status=run["status"],
+        error_message=run["error_message"],
+        attempt_count=run["attempt_count"],
+        max_attempts=run["max_attempts"],
+        created_at=run["created_at"],
+        started_at=run["started_at"],
+        completed_at=run["completed_at"],
+        updated_at=run["updated_at"],
+        steps=steps,
+        latest_step_number=latest_step,
+        assistant_messages=assistant_messages,
+    )
+
+
 @router.get("/{conversation_id}", response_model=ConversationDetailOut)
 def get_project_conversation(
     project_uuid: UUID,
@@ -133,11 +170,27 @@ def get_project_conversation(
         project_uuid=project_uuid,
         conversation_id=conversation_id,
     )
+    repositories_agent.expire_stale_runs(db, conversation_id=conversation_id)
     messages, has_more = repositories_agent.list_visible_messages(
         db,
         conversation_id=conversation_id,
         limit=limit,
         offset=offset,
+    )
+    active_run_row = repositories_agent.get_active_run_for_conversation(
+        db,
+        conversation_id=conversation_id,
+    )
+    active_run = (
+        _build_run_status_out(
+            db,
+            conversation_id=conversation_id,
+            run=active_run_row,
+            after_step=0,
+            limit=100,
+        )
+        if active_run_row is not None
+        else None
     )
     return ConversationDetailOut(
         conversation=conv,
@@ -145,6 +198,7 @@ def get_project_conversation(
         limit=limit,
         offset=offset,
         has_more=has_more,
+        active_run=active_run,
     )
 
 
@@ -241,12 +295,6 @@ def submit_conversation_message(
             },
         )
 
-    # Only spawn a separate DB-connection thread when get_db is not overridden by an
-    # uncommitted rollback test fixture.
-    is_test_override = get_db in request.app.dependency_overrides
-    if not is_test_override and not deduplicated:
-        trigger_background_run(run["id"], enabled=True)
-
     return ConversationMessageSubmitOut(
         run_id=run["id"],
         conversation_id=conversation_id,
@@ -259,7 +307,6 @@ def submit_conversation_message(
 
 @router.get("/{conversation_id}/runs/{run_id}", response_model=AgentRunStatusOut)
 def get_conversation_run_status(
-    request: Request,
     project_uuid: UUID,
     conversation_id: UUID,
     run_id: UUID,
@@ -297,37 +344,87 @@ def get_conversation_run_status(
             detail="Run not found",
         )
 
-    # Poll-assisted recovery for serverless environments: if the run is still queued
-    # or its worker lease expired while still eligible for retry, trigger background execution.
-    is_test_override = get_db in request.app.dependency_overrides
-    if not is_test_override and run["status"] in ("queued", "running"):
-        trigger_background_run(run_id, enabled=True)
-
-    steps, latest_step = repositories_agent.list_run_steps(
+    return _build_run_status_out(
         db,
-        run_id=run_id,
+        conversation_id=conversation_id,
+        run=run,
         after_step=after_step,
         limit=limit,
     )
-    assistant_messages = repositories_agent.list_assistant_messages_for_run(
+
+
+@router.post(
+    "/{conversation_id}/runs/{run_id}/advance",
+    response_model=AgentRunStatusOut,
+    dependencies=[Depends(require_trusted_origin)],
+)
+def advance_conversation_run(
+    request: Request,
+    project_uuid: UUID,
+    conversation_id: UUID,
+    run_id: UUID,
+    after_step: int = Query(
+        default=0,
+        ge=0,
+        description="Cursor: only return run steps with step_number > after_step",
+    ),
+    limit: int = Query(default=100, ge=1, le=500),
+    user: dict = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+    db=Depends(get_db),
+) -> AgentRunStatusOut:
+    """Execute a bounded slice of work (~240s) for a queued or recoverable agent run."""
+    _require_conversation(
+        db,
+        user_id=user["id"],
+        project_uuid=project_uuid,
+        conversation_id=conversation_id,
+    )
+
+    repositories_agent.expire_stale_runs(
         db,
         conversation_id=conversation_id,
         run_id=run_id,
     )
 
-    return AgentRunStatusOut(
-        run_id=run["id"],
-        conversation_id=run["conversation_id"],
-        user_message_id=run["user_message_id"],
-        status=run["status"],
-        error_message=run["error_message"],
-        attempt_count=run["attempt_count"],
-        max_attempts=run["max_attempts"],
-        created_at=run["created_at"],
-        started_at=run["started_at"],
-        completed_at=run["completed_at"],
-        updated_at=run["updated_at"],
-        steps=steps,
-        latest_step_number=latest_step,
-        assistant_messages=assistant_messages,
+    run = repositories_agent.get_run(
+        db,
+        conversation_id=conversation_id,
+        run_id=run_id,
+    )
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Run not found",
+        )
+
+    # Terminal runs are never executed again.
+    if run["status"] in ("queued", "running"):
+        is_test_override = get_db in request.app.dependency_overrides
+        claim_and_execute_run(
+            db,
+            run_id=run_id,
+            settings=settings,
+            invocation_timeout_seconds=settings.agent_invocation_timeout_seconds,
+            commit_step=(None if is_test_override else db.commit),
+        )
+        repositories_agent.expire_stale_runs(
+            db,
+            conversation_id=conversation_id,
+            run_id=run_id,
+        )
+        updated_run = repositories_agent.get_run(
+            db,
+            conversation_id=conversation_id,
+            run_id=run_id,
+        )
+        if updated_run is not None:
+            run = updated_run
+
+    return _build_run_status_out(
+        db,
+        conversation_id=conversation_id,
+        run=run,
+        after_step=after_step,
+        limit=limit,
     )

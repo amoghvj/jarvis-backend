@@ -191,6 +191,7 @@ class ConversationDetailOut(BaseModel):
     limit: int
     offset: int
     has_more: bool
+    active_run: Optional["AgentRunStatusOut"] = None
 
 
 class ConversationDeleteOut(BaseModel):

@@ -20,6 +20,15 @@ class ActiveRunConflictError(Exception):
         self.active_run_id = active_run_id
 
 
+class LeaseLostError(Exception):
+    """Raised when a worker attempts a write after losing or expiring its run lease."""
+
+    def __init__(self, run_id: UUID, worker_id: str) -> None:
+        super().__init__(f"Worker '{worker_id}' lost lease ownership of run {run_id}")
+        self.run_id = run_id
+        self.worker_id = worker_id
+
+
 def derive_conversation_title(content: str) -> str:
     """Deterministically generate a concise conversation title from the first user message."""
     cleaned = " ".join((content or "").strip().split())
@@ -232,8 +241,15 @@ def append_conversation_message(
     metadata: Optional[Dict[str, Any]] = None,
     run_id: Optional[UUID] = None,
     set_title_if_empty: bool = False,
+    expected_worker_id: Optional[str] = None,
+    fencing_run_id: Optional[UUID] = None,
 ) -> Dict[str, Any]:
-    """Atomically allocate the next sequence_number for a conversation and persist a message."""
+    """Atomically allocate the next sequence_number for a conversation and persist a message.
+
+    When `expected_worker_id` is supplied, locks and verifies active lease ownership of
+    `fencing_run_id or run_id` inside the same database transaction (after locking the
+    conversation row, preserving canonical lock order: conversations -> agent_runs).
+    """
     with conn.transaction():
         conv = conn.execute(
             "SELECT id, title FROM public.conversations WHERE id = %s FOR UPDATE",
@@ -241,6 +257,12 @@ def append_conversation_message(
         ).fetchone()
         if conv is None:
             raise ValueError(f"Conversation {conversation_id} does not exist")
+
+        if expected_worker_id is not None:
+            fence_target = fencing_run_id or run_id
+            if fence_target is None:
+                raise ValueError("run_id or fencing_run_id is required when expected_worker_id is set")
+            require_run_lease(conn, run_id=fence_target, worker_id=expected_worker_id)
 
         seq_row = conn.execute(
             """
@@ -550,7 +572,7 @@ def expire_stale_runs(
     conversation_id: Optional[UUID] = None,
     run_id: Optional[UUID] = None,
 ) -> List[Dict[str, Any]]:
-    """Fail runs that have exceeded their overall execution timeout or exhausted retries after lease expiry."""
+    """Fail runs that have exceeded their overall timeout or exhausted retries after lease expiry/malformation."""
     filters = ["status IN ('queued', 'running')"]
     params: List[Any] = []
     if conversation_id is not None:
@@ -561,43 +583,51 @@ def expire_stale_runs(
         params.append(run_id)
 
     where_sql = " AND ".join(filters)
-    stale_rows = conn.execute(
-        f"""
-        UPDATE public.agent_runs
-        SET status = 'failed',
-            error_message = CASE
-                WHEN timeout_at IS NOT NULL AND timeout_at <= clock_timestamp()
-                    THEN 'Investigation run timed out before completion.'
-                ELSE COALESCE(error_message, 'Investigation worker lease expired and maximum retry attempts were reached.')
-            END,
-            completed_at = COALESCE(completed_at, clock_timestamp()),
-            lease_expires_at = NULL,
-            updated_at = clock_timestamp()
-        WHERE {where_sql}
-          AND (
-              (timeout_at IS NOT NULL AND timeout_at <= clock_timestamp())
-              OR (
-                  status = 'running'
-                  AND lease_expires_at IS NOT NULL
-                  AND lease_expires_at <= clock_timestamp()
-                  AND attempt_count >= max_attempts
+    with conn.transaction():
+        stale_rows = conn.execute(
+            f"""
+            UPDATE public.agent_runs
+            SET status = 'failed',
+                error_message = CASE
+                    WHEN timeout_at IS NOT NULL AND timeout_at <= clock_timestamp()
+                        THEN 'Investigation run timed out before completion.'
+                    WHEN status = 'running' AND (lease_expires_at IS NULL OR worker_id IS NULL)
+                        THEN COALESCE(error_message, 'Investigation worker lease was invalid and maximum retry attempts were reached.')
+                    ELSE COALESCE(error_message, 'Investigation worker lease expired and maximum retry attempts were reached.')
+                END,
+                completed_at = COALESCE(completed_at, clock_timestamp()),
+                worker_id = NULL,
+                lease_expires_at = NULL,
+                next_retry_at = NULL,
+                updated_at = clock_timestamp()
+            WHERE {where_sql}
+              AND (
+                  (timeout_at IS NOT NULL AND timeout_at <= clock_timestamp())
+                  OR (
+                      status = 'running'
+                      AND (
+                          lease_expires_at IS NULL
+                          OR lease_expires_at <= clock_timestamp()
+                          OR worker_id IS NULL
+                      )
+                      AND attempt_count >= max_attempts
+                  )
               )
-          )
-        RETURNING {_RUN_COLUMNS}
-        """,
-        tuple(params),
-    ).fetchall()
+            RETURNING {_RUN_COLUMNS}
+            """,
+            tuple(params),
+        ).fetchall()
 
-    expired = [dict(r) for r in stale_rows]
-    for r in expired:
-        append_run_step(
-            conn,
-            run_id=r["id"],
-            step_type="run_failed",
-            status="failed",
-            output_summary={"message": r["error_message"] or "Run timed out or exhausted retries"},
-        )
-    return expired
+        expired = [dict(r) for r in stale_rows]
+        for r in expired:
+            append_run_step(
+                conn,
+                run_id=r["id"],
+                step_type="run_failed",
+                status="failed",
+                output_summary={"message": r["error_message"] or "Run timed out or exhausted retries"},
+            )
+        return expired
 
 
 def submit_user_message_and_create_run(
@@ -744,17 +774,39 @@ def get_run(
     return dict(row) if row else None
 
 
+def get_active_run_for_conversation(
+    conn: Any,
+    *,
+    conversation_id: UUID,
+) -> Optional[Dict[str, Any]]:
+    """Return the currently active (queued or running) run for a conversation, if any."""
+    row = conn.execute(
+        f"""
+        SELECT {_RUN_COLUMNS}
+        FROM public.agent_runs
+        WHERE conversation_id = %s
+          AND status IN ('queued', 'running')
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (conversation_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def claim_run(
     conn: Any,
     *,
     worker_id: str,
-    lease_seconds: int = 45,
+    lease_seconds: int = 90,
     run_id: Optional[UUID] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Atomically claim a queued run or recover a running run whose worker lease expired.
+    """Atomically claim a queued run or recover a running run whose lease expired or is malformed.
 
     Uses PostgreSQL `FOR UPDATE SKIP LOCKED` so concurrent workers never claim the same run.
     """
+    if not isinstance(worker_id, str) or not worker_id.strip():
+        raise ValueError("worker_id must be a non-empty string")
     with conn.transaction():
         expire_stale_runs(conn, run_id=run_id)
 
@@ -771,8 +823,11 @@ def claim_run(
                     )
                     OR (
                         r.status = 'running'
-                        AND r.lease_expires_at IS NOT NULL
-                        AND r.lease_expires_at <= clock_timestamp()
+                        AND (
+                            r.lease_expires_at IS NULL
+                            OR r.lease_expires_at <= clock_timestamp()
+                            OR r.worker_id IS NULL
+                        )
                         AND r.attempt_count < r.max_attempts
                     )
                 )
@@ -812,7 +867,11 @@ def claim_run(
                 ar.created_at,
                 ar.started_at,
                 ar.completed_at,
-                ar.updated_at
+                ar.updated_at,
+                CASE
+                    WHEN ar.timeout_at IS NULL THEN NULL
+                    ELSE GREATEST(0.0, EXTRACT(EPOCH FROM (ar.timeout_at - clock_timestamp())))
+                END AS remaining_timeout_seconds
             """,
             (*([run_id] if run_id is not None else []), worker_id, max(10, int(lease_seconds))),
         ).fetchone()
@@ -830,14 +889,68 @@ def claim_run(
         return run_dict
 
 
+def require_run_lease(
+    conn: Any,
+    *,
+    run_id: UUID,
+    worker_id: str,
+    refresh_lease_seconds: Optional[int] = None,
+) -> None:
+    """Lock the agent_runs row FOR UPDATE and assert valid, non-null worker lease ownership.
+
+    Raises `LeaseLostError` if the run is not `'running'`, lacks a non-null `worker_id`
+    matching `worker_id`, or has a null or expired `lease_expires_at`. When
+    `refresh_lease_seconds` is provided, extends the lease inside the same transaction.
+    """
+    if not isinstance(worker_id, str) or not worker_id.strip():
+        raise LeaseLostError(run_id, str(worker_id or ""))
+    row = conn.execute(
+        """
+        SELECT
+            id,
+            (
+                status = 'running'
+                AND worker_id IS NOT NULL
+                AND worker_id = %s
+                AND lease_expires_at IS NOT NULL
+                AND lease_expires_at > clock_timestamp()
+            ) AS lease_valid
+        FROM public.agent_runs
+        WHERE id = %s
+        FOR UPDATE
+        """,
+        (worker_id, run_id),
+    ).fetchone()
+    if row is None or not bool(row["lease_valid"]):
+        raise LeaseLostError(run_id, worker_id)
+
+    if refresh_lease_seconds is not None:
+        conn.execute(
+            """
+            UPDATE public.agent_runs
+            SET heartbeat_at = clock_timestamp(),
+                lease_expires_at = clock_timestamp() + make_interval(secs => %s),
+                updated_at = clock_timestamp()
+            WHERE id = %s
+              AND worker_id = %s
+              AND status = 'running'
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > clock_timestamp()
+            """,
+            (max(10, int(refresh_lease_seconds)), run_id, worker_id),
+        )
+
+
 def heartbeat_run(
     conn: Any,
     *,
     run_id: UUID,
     worker_id: str,
-    lease_seconds: int = 45,
+    lease_seconds: int = 90,
 ) -> bool:
-    """Refresh the worker lease and heartbeat timestamp while a run is actively executing."""
+    """Refresh the worker lease and heartbeat timestamp while ownership and lease remain valid."""
+    if not isinstance(worker_id, str) or not worker_id.strip():
+        return False
     row = conn.execute(
         """
         UPDATE public.agent_runs
@@ -847,6 +960,8 @@ def heartbeat_run(
         WHERE id = %s
           AND worker_id = %s
           AND status = 'running'
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > clock_timestamp()
         RETURNING id
         """,
         (max(10, int(lease_seconds)), run_id, worker_id),
@@ -860,19 +975,56 @@ def complete_run(
     run_id: UUID,
     worker_id: str,
 ) -> Optional[Dict[str, Any]]:
-    """Transition a running agent run to completed."""
+    """Transition a running agent run to completed and clear lease fields if lease is valid."""
     row = conn.execute(
         f"""
         UPDATE public.agent_runs
         SET status = 'completed',
             error_message = NULL,
+            worker_id = NULL,
             lease_expires_at = NULL,
+            next_retry_at = NULL,
             heartbeat_at = clock_timestamp(),
             completed_at = clock_timestamp(),
             updated_at = clock_timestamp()
         WHERE id = %s
           AND worker_id = %s
           AND status = 'running'
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > clock_timestamp()
+        RETURNING {_RUN_COLUMNS}
+        """,
+        (run_id, worker_id),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def yield_run_for_continuation(
+    conn: Any,
+    *,
+    run_id: UUID,
+    worker_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Release a running worker lease back to queued for bounded multi-invocation continuation.
+
+    Decrements attempt_count by 1 so normal bounded time-slice continuations do not
+    consume crash-recovery retry attempts.
+    """
+    row = conn.execute(
+        f"""
+        UPDATE public.agent_runs
+        SET status = 'queued',
+            worker_id = NULL,
+            lease_expires_at = NULL,
+            next_retry_at = NULL,
+            heartbeat_at = clock_timestamp(),
+            attempt_count = GREATEST(0, attempt_count - 1),
+            updated_at = clock_timestamp()
+        WHERE id = %s
+          AND worker_id = %s
+          AND status = 'running'
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > clock_timestamp()
         RETURNING {_RUN_COLUMNS}
         """,
         (run_id, worker_id),
@@ -922,6 +1074,8 @@ def fail_or_retry_run(
         WHERE id = %s
           AND worker_id = %s
           AND status = 'running'
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > clock_timestamp()
         RETURNING {_RUN_COLUMNS}
         """,
         (
@@ -951,13 +1105,23 @@ def append_run_step(
     tool_name: Optional[str] = None,
     input_summary: Optional[Dict[str, Any]] = None,
     output_summary: Optional[Dict[str, Any]] = None,
+    expected_worker_id: Optional[str] = None,
+    refresh_lease_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Atomically allocate the next step_number for a run and insert a sanitized step record."""
     with conn.transaction():
-        conn.execute(
-            "SELECT id FROM public.agent_runs WHERE id = %s FOR UPDATE",
-            (run_id,),
-        )
+        if expected_worker_id is not None:
+            require_run_lease(
+                conn,
+                run_id=run_id,
+                worker_id=expected_worker_id,
+                refresh_lease_seconds=refresh_lease_seconds,
+            )
+        else:
+            conn.execute(
+                "SELECT id FROM public.agent_runs WHERE id = %s FOR UPDATE",
+                (run_id,),
+            )
         seq_row = conn.execute(
             """
             SELECT COALESCE(MAX(step_number), 0) + 1 AS next_step
@@ -1043,3 +1207,47 @@ def list_run_steps(
     ).fetchone()
     latest_step = int(max_row["max_step"]) if max_row else 0
     return [dict(r) for r in rows], latest_step
+
+
+def count_completed_model_iterations_for_run(
+    conn: Any,
+    *,
+    run_id: UUID,
+) -> int:
+    """Count completed model iterations persisted across all invocations of a run."""
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM public.agent_run_steps
+        WHERE run_id = %s
+          AND step_type = 'model_completed'
+        """,
+        (run_id,),
+    ).fetchone()
+    return int(row["cnt"]) if row else 0
+
+
+def list_completed_tool_summaries_for_run(
+    conn: Any,
+    *,
+    run_id: UUID,
+) -> List[str]:
+    """Return tool output summaries recorded in earlier invocations of a run."""
+    rows = conn.execute(
+        """
+        SELECT output_summary
+        FROM public.agent_run_steps
+        WHERE run_id = %s
+          AND step_type IN ('tool_completed', 'tool_failed')
+        ORDER BY step_number ASC
+        """,
+        (run_id,),
+    ).fetchall()
+    summaries: List[str] = []
+    for r in rows:
+        out = r.get("output_summary")
+        if isinstance(out, dict):
+            s = out.get("summary")
+            if isinstance(s, str) and s.strip():
+                summaries.append(s.strip())
+    return summaries

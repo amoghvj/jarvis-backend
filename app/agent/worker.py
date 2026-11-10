@@ -1,17 +1,13 @@
-"""Durable PostgreSQL-backed worker and background execution coordinator for agent runs.
+"""Durable PostgreSQL-backed worker and execution coordinator for agent runs.
 
-Supports three complementary execution modes using the same atomic `FOR UPDATE SKIP LOCKED`
+Supports two complementary execution modes using the same atomic `FOR UPDATE SKIP LOCKED`
 database queue (`public.agent_runs`):
 
-1. **Async Background Worker Thread (`trigger_background_run`)**:
-   Spawned immediately after `POST .../messages` commits a queued run so local/container
-   deployments process runs asynchronously without blocking the HTTP response.
-2. **Poll-Assisted Lease Recovery (`recover_or_trigger_on_poll`)**:
-   On Vercel serverless functions, if the `POST .../messages` container freezes after
-   returning its HTTP response (leaving the run `queued` or with an expired `lease_expires_at`),
-   subsequent `GET .../runs/{run_id}` polls detect the unclaimed/expired run and spawn or
-   advance recovery.
-3. **Standalone Persistent Worker Loop (`run_worker_loop` / `scripts/run_agent_worker.py`)**:
+1. **Bounded Serverless Continuation (`claim_and_execute_run`)**:
+   Invoked by `POST .../runs/{run_id}/advance` (including on Vercel serverless functions)
+   to atomically claim or resume a run for a bounded time slice and persist progress
+   before yielding cleanly back to `queued` when continuation is needed.
+2. **Standalone Persistent Worker Loop (`run_worker_loop` / `scripts/run_agent_worker.py`)**:
    Can run as a dedicated background worker process polling PostgreSQL via `FOR UPDATE SKIP LOCKED`.
 """
 
@@ -40,9 +36,6 @@ from app.tools.schemas import ToolContext
 
 logger = logging.getLogger("jarvis.agent.worker")
 
-_ACTIVE_LOCAL_RUNS_LOCK = threading.Lock()
-_ACTIVE_LOCAL_RUNS: set[UUID] = set()
-
 
 def generate_worker_id(prefix: str = "worker") -> str:
     host = socket.gethostname()[:32] or "host"
@@ -60,9 +53,11 @@ def claim_and_execute_run(
     history_manager: Optional[HistoryManager] = None,
     tool_registry: Optional[ToolRegistry] = None,
     settings: Optional[Settings] = None,
+    invocation_timeout_seconds: Optional[float] = None,
+    max_iterations_per_invocation: Optional[int] = None,
     commit_step: Optional[Callable[[], None]] = None,
 ) -> Optional[AgentRunOutcome]:
-    """Atomically claim the specified (or next eligible) run and execute it to completion."""
+    """Atomically claim the specified (or next eligible) run and execute it for one bounded invocation or to completion."""
     cfg = settings or get_settings()
     wid = worker_id or generate_worker_id()
     commit = commit_step or (lambda: None)
@@ -85,25 +80,50 @@ def claim_and_execute_run(
     reg = tool_registry or get_default_registry()
     hist = history_manager or FullHistoryManager()
 
-    try:
-        llm = model or create_groq_chat_model(cfg, registry=reg, bind_default_tools=True)
-    except Exception as exc:
-        safe_msg = redact(f"Failed to initialize language model: {exc}")
-        repositories_agent.fail_or_retry_run(
+    def _model_heartbeat() -> bool:
+        ok = repositories_agent.heartbeat_run(
             conn,
             run_id=claimed_run_id,
             worker_id=wid,
-            error_message=safe_msg,
-            retryable=False,
-        )
-        repositories_agent.append_run_step(
-            conn,
-            run_id=claimed_run_id,
-            step_type="run_failed",
-            status="failed",
-            output_summary={"error_code": "model_init_error", "message": safe_msg},
+            lease_seconds=cfg.agent_lease_seconds,
         )
         commit()
+        return ok
+
+    try:
+        llm = model or create_groq_chat_model(
+            cfg,
+            registry=reg,
+            bind_default_tools=True,
+            heartbeat_callback=_model_heartbeat,
+        )
+    except Exception as exc:
+        safe_msg = redact(f"Failed to initialize language model: {exc}")
+        with conn.transaction():
+            updated_run = repositories_agent.fail_or_retry_run(
+                conn,
+                run_id=claimed_run_id,
+                worker_id=wid,
+                error_message=safe_msg,
+                retryable=False,
+            )
+            if updated_run is not None and updated_run["status"] == "failed":
+                repositories_agent.append_run_step(
+                    conn,
+                    run_id=claimed_run_id,
+                    step_type="run_failed",
+                    status="failed",
+                    output_summary={"error_code": "model_init_error", "message": safe_msg},
+                )
+        commit()
+        if updated_run is None:
+            return AgentRunOutcome(
+                run_id=claimed_run_id,
+                conversation_id=conversation_id,
+                status="running",
+                iterations=0,
+                tool_calls_executed=0,
+            )
         return AgentRunOutcome(
             run_id=claimed_run_id,
             conversation_id=conversation_id,
@@ -119,6 +139,19 @@ def claim_and_execute_run(
         conn=conn,
     )
 
+    effective_run_timeout: float = float(cfg.agent_run_timeout_seconds)
+    if claimed.get("remaining_timeout_seconds") is not None:
+        effective_run_timeout = max(
+            0.0,
+            min(effective_run_timeout, float(claimed["remaining_timeout_seconds"])),
+        )
+
+    effective_invocation_timeout: Optional[float] = (
+        float(invocation_timeout_seconds)
+        if invocation_timeout_seconds is not None
+        else float(cfg.agent_invocation_timeout_seconds)
+    )
+
     return run_agent(
         conversation_id=conversation_id,
         run_id=claimed_run_id,
@@ -128,60 +161,15 @@ def claim_and_execute_run(
         execution_context=ctx,
         tool_registry=reg,
         max_iterations=cfg.agent_max_iterations,
-        run_timeout_seconds=cfg.agent_run_timeout_seconds,
+        run_timeout_seconds=effective_run_timeout,
+        invocation_timeout_seconds=effective_invocation_timeout,
+        invocation_reserve_seconds=float(cfg.agent_invocation_reserve_seconds),
+        model_timeout_seconds=float(cfg.agent_model_timeout_seconds),
+        max_iterations_per_invocation=max_iterations_per_invocation,
         lease_seconds=cfg.agent_lease_seconds,
         max_tool_result_chars=cfg.agent_max_tool_result_chars,
         commit_step=commit,
     )
-
-
-def _background_worker_entry(run_id: UUID) -> None:
-    """Thread target that opens an independent DB connection and executes `run_id`."""
-    try:
-        cfg = get_settings()
-        if not cfg.database_url:
-            return
-        with open_connection() as conn:
-            claim_and_execute_run(
-                conn,
-                run_id=run_id,
-                settings=cfg,
-            )
-    except Exception as exc:
-        logger.error(
-            "Background worker thread for run %s failed: %s",
-            run_id,
-            redact(f"{type(exc).__name__}: {exc}"),
-        )
-    finally:
-        with _ACTIVE_LOCAL_RUNS_LOCK:
-            _ACTIVE_LOCAL_RUNS.discard(run_id)
-
-
-def trigger_background_run(run_id: UUID, *, enabled: bool = True) -> bool:
-    """Spawn a non-blocking daemon thread to claim and execute `run_id` if not already running locally."""
-    if not enabled:
-        return False
-    try:
-        cfg = get_settings()
-        if not cfg.database_url:
-            return False
-    except Exception:
-        return False
-
-    with _ACTIVE_LOCAL_RUNS_LOCK:
-        if run_id in _ACTIVE_LOCAL_RUNS:
-            return False
-        _ACTIVE_LOCAL_RUNS.add(run_id)
-
-    thread = threading.Thread(
-        target=_background_worker_entry,
-        args=(run_id,),
-        name=f"jarvis-agent-run-{str(run_id)[:8]}",
-        daemon=True,
-    )
-    thread.start()
-    return True
 
 
 def run_worker_loop(

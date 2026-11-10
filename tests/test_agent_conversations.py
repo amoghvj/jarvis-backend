@@ -37,6 +37,10 @@ def test_conversations_require_authentication(client, db):
         headers=csrf(),
     ).status_code == 401
     assert client.get(f"/projects/{pid}/conversations/{cid}/runs/{rid}").status_code == 401
+    assert client.post(
+        f"/projects/{pid}/conversations/{cid}/runs/{rid}/advance",
+        headers=csrf(),
+    ).status_code == 401
 
 
 def test_mutating_conversation_routes_enforce_csrf_origin(client, db, github):
@@ -53,6 +57,9 @@ def test_mutating_conversation_routes_enforce_csrf_origin(client, db, github):
     assert client.post(
         f"/projects/{pid}/conversations/{cid}/messages",
         json={"content": "hello"},
+    ).status_code == 403
+    assert client.post(
+        f"/projects/{pid}/conversations/{cid}/runs/{uuid4()}/advance",
     ).status_code == 403
     assert client.delete(f"/projects/{pid}/conversations/{cid}").status_code == 403
 
@@ -456,3 +463,180 @@ def test_run_polling_incremental_steps_and_visible_transcript_separation(client,
     conv_detail = client.get(f"/projects/{pid}/conversations/{cid}").json()
     roles_and_types = [(m["role"], m["message_type"]) for m in conv_detail["messages"]]
     assert roles_and_types == [("user", "text"), ("assistant", "text")]
+    assert conv_detail["active_run"] is None
+
+
+def test_advance_endpoint_multi_invocation_continuation_concurrency_and_completed_noop(
+    client, db, github, monkeypatch
+):
+    """Verify:
+    1. GET conversation detail returns active_run when a run is queued/running (page refresh recovery).
+    2. Sequential POST .../advance invocations each execute bounded work and return 'queued'
+       until the final invocation returns 'completed'.
+    3. Concurrent POST .../advance while a run is actively leased returns 'running' without
+       re-executing or duplicating work.
+    4. POST .../advance on a completed run never executes again.
+    """
+    from langchain_core.messages import AIMessage
+    from langchain_core.runnables import RunnableLambda
+    import app.routes.conversations as conv_routes
+    from app.agent.worker import claim_and_execute_run as real_claim_and_execute
+
+    proj = _login_and_create_project(client, db, github, project_key="proj-advance")
+    pid = proj["id"]
+    conv = client.post(f"/projects/{pid}/conversations", headers=csrf()).json()
+    cid = conv["id"]
+
+    sub = client.post(
+        f"/projects/{pid}/conversations/{cid}/messages",
+        json={"content": "Investigate multi-step issue across bounded invocations"},
+        headers=csrf(),
+    ).json()
+    run_id = sub["run_id"]
+    assert sub["status"] == "queued"
+
+    # Page reload check: GET conversation detail includes active_run while queued
+    detail_queued = client.get(f"/projects/{pid}/conversations/{cid}").json()
+    assert detail_queued["active_run"] is not None
+    assert detail_queued["active_run"]["run_id"] == run_id
+    assert detail_queued["active_run"]["status"] == "queued"
+
+    model_calls = {"count": 0}
+
+    def scripted_model(messages):
+        model_calls["count"] += 1
+        n = model_calls["count"]
+        if n == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_step_1",
+                        "name": "search_events",
+                        "args": {"limit": 5},
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        if n == 2:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_step_2",
+                        "name": "search_events",
+                        "args": {"severity": "ERROR", "limit": 5},
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        return AIMessage(
+            content="Confirmed Facts: Completed investigation across 3 bounded invocations."
+        )
+
+    def _bounded_claim_and_execute(conn, **kwargs):
+        return real_claim_and_execute(
+            conn,
+            run_id=kwargs.get("run_id"),
+            settings=kwargs.get("settings"),
+            model=RunnableLambda(scripted_model),
+            max_iterations_per_invocation=1,
+            commit_step=kwargs.get("commit_step"),
+        )
+
+    monkeypatch.setattr(conv_routes, "claim_and_execute_run", _bounded_claim_and_execute)
+
+    # Invocation 1: executes iteration 1 (list_incidents) and yields back to 'queued'
+    adv1 = client.post(
+        f"/projects/{pid}/conversations/{cid}/runs/{run_id}/advance",
+        headers=csrf(),
+    )
+    assert adv1.status_code == 200
+    d1 = adv1.json()
+    assert d1["status"] == "queued"
+    assert d1["attempt_count"] == 0  # Normal yield does not consume crash retry attempts
+    assert model_calls["count"] == 1
+    assert any(s["tool_name"] == "search_events" and s["step_type"] == "tool_completed" for s in d1["steps"])
+
+    # Simulate another tab holding an active lease: concurrent /advance must NOT invoke model
+    claimed_other = repositories_agent.claim_run(db, worker_id="other-tab-worker", lease_seconds=60, run_id=run_id)
+    assert claimed_other is not None and claimed_other["status"] == "running"
+
+    adv_concurrent = client.post(
+        f"/projects/{pid}/conversations/{cid}/runs/{run_id}/advance",
+        params={"after_step": d1["latest_step_number"]},
+        headers=csrf(),
+    )
+    assert adv_concurrent.status_code == 200
+    assert adv_concurrent.json()["status"] == "running"
+    assert model_calls["count"] == 1  # Model was NOT called while leased!
+
+    # Simulate lease expiration from the other tab (e.g. function timeout) -> next /advance recovers!
+    db.execute(
+        "UPDATE public.agent_runs SET lease_expires_at = clock_timestamp() - interval '5 seconds', attempt_count = 0 WHERE id = %s",
+        (run_id,),
+    )
+
+    # Invocation 2: recovers expired lease, executes iteration 2 (search_events), yields back to 'queued'
+    adv2 = client.post(
+        f"/projects/{pid}/conversations/{cid}/runs/{run_id}/advance",
+        params={"after_step": d1["latest_step_number"]},
+        headers=csrf(),
+    )
+    assert adv2.status_code == 200
+    d2 = adv2.json()
+    assert d2["status"] == "queued"
+    assert model_calls["count"] == 2
+    assert any(s["tool_name"] == "search_events" and s["step_type"] == "tool_completed" for s in d2["steps"])
+
+    # Invocation 3: executes iteration 3 (final answer) and transitions run to 'completed'
+    adv3 = client.post(
+        f"/projects/{pid}/conversations/{cid}/runs/{run_id}/advance",
+        params={"after_step": d2["latest_step_number"]},
+        headers=csrf(),
+    )
+    assert adv3.status_code == 200
+    d3 = adv3.json()
+    assert d3["status"] == "completed"
+    assert model_calls["count"] == 3
+    assert len(d3["assistant_messages"]) == 1
+    assert "3 bounded invocations" in d3["assistant_messages"][0]["content"]
+
+    # Invocation 4 on already-completed run: must never execute again
+    adv4 = client.post(
+        f"/projects/{pid}/conversations/{cid}/runs/{run_id}/advance",
+        headers=csrf(),
+    )
+    assert adv4.status_code == 200
+    assert adv4.json()["status"] == "completed"
+    assert model_calls["count"] == 3
+
+    # Verify GET .../runs/{run_id} never calls claim_and_execute_run (strictly read-only polling)
+    called_on_get = {"flag": False}
+    def _fail_if_called(*args, **kwargs):
+        called_on_get["flag"] = True
+        raise AssertionError("claim_and_execute_run must never be invoked from GET!")
+    monkeypatch.setattr(conv_routes, "claim_and_execute_run", _fail_if_called)
+
+    sub_get_check = client.post(
+        f"/projects/{pid}/conversations/{cid}/messages",
+        json={"content": "Verify GET does not execute"},
+        headers=csrf(),
+    ).json()
+    poll_ro = client.get(
+        f"/projects/{pid}/conversations/{cid}/runs/{sub_get_check['run_id']}"
+    )
+    assert poll_ro.status_code == 200
+    assert poll_ro.json()["status"] == "queued"
+    assert called_on_get["flag"] is False
+
+    # Cross-project access to /advance is rejected with 404
+    other_proj = client.post(
+        "/projects",
+        json={"project_id": "proj-other-adv", "name": "Other Adv"},
+        headers=csrf(),
+    ).json()
+    assert client.post(
+        f"/projects/{other_proj['id']}/conversations/{cid}/runs/{run_id}/advance",
+        headers=csrf(),
+    ).status_code == 404

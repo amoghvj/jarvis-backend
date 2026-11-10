@@ -251,10 +251,12 @@ class GroqChatModel(BaseChatModel):
     temperature: float = Field(default=0.1)
     max_tokens: int = Field(default=2048)
     timeout_seconds: float = Field(default=45.0)
+    call_deadline: Optional[float] = Field(default=None, exclude=True)
     max_http_retries: int = Field(default=2)
     bound_tools: List[Dict[str, Any]] = Field(default_factory=list)
     tool_choice: Optional[Union[str, Dict[str, Any]]] = Field(default="auto")
     http_client: Optional[httpx.Client] = Field(default=None, exclude=True)
+    heartbeat_callback: Optional[Callable[[], Any]] = Field(default=None, exclude=True)
 
     @property
     def _llm_type(self) -> str:
@@ -322,17 +324,50 @@ class GroqChatModel(BaseChatModel):
         attempts = max(1, int(self.max_http_retries) + 1)
         last_exc: Optional[AgentModelError] = None
 
+        def _refresh_lease_before_retry() -> None:
+            if self.heartbeat_callback is None:
+                return
+            try:
+                hb_ok = self.heartbeat_callback()
+            except Exception as exc:
+                if type(exc).__name__ == "LeaseLostError":
+                    raise
+                return
+            if hb_ok is False:
+                raise AgentModelError(
+                    "lease_lost",
+                    "Worker lease ownership was lost before retrying language model request.",
+                    retryable=False,
+                )
+
+        def _has_budget_for_retry(wait_s: float = 0.0) -> bool:
+            if self.call_deadline is None:
+                return True
+            remaining = self.call_deadline - time.monotonic()
+            return remaining > (max(0.0, wait_s) + 1.5)
+
         for attempt in range(1, attempts + 1):
+            attempt_timeout = float(self.timeout_seconds)
+            if self.call_deadline is not None:
+                remaining = self.call_deadline - time.monotonic()
+                if remaining <= 0.05:
+                    raise last_exc or AgentModelError(
+                        "model_timeout",
+                        "The language model request exceeded the remaining execution budget.",
+                        retryable=True,
+                    )
+                attempt_timeout = min(attempt_timeout, remaining)
+
             try:
                 if self.http_client is not None:
                     resp = self.http_client.post(
                         url,
                         headers=headers,
                         json=payload,
-                        timeout=self.timeout_seconds,
+                        timeout=attempt_timeout,
                     )
                 else:
-                    with httpx.Client(timeout=self.timeout_seconds) as client:
+                    with httpx.Client(timeout=attempt_timeout) as client:
                         resp = client.post(url, headers=headers, json=payload)
             except httpx.TimeoutException:
                 last_exc = AgentModelError(
@@ -340,8 +375,10 @@ class GroqChatModel(BaseChatModel):
                     "The language model request timed out.",
                     retryable=True,
                 )
-                if attempt < attempts:
-                    time.sleep(min(2.0 * attempt, 5.0))
+                wait_s = min(2.0 * attempt, 5.0)
+                if attempt < attempts and _has_budget_for_retry(wait_s):
+                    _refresh_lease_before_retry()
+                    time.sleep(wait_s)
                     continue
                 raise last_exc
             except httpx.HTTPError as exc:
@@ -350,8 +387,10 @@ class GroqChatModel(BaseChatModel):
                     f"Failed to reach language model endpoint: {type(exc).__name__}",
                     retryable=True,
                 )
-                if attempt < attempts:
-                    time.sleep(min(1.5 * attempt, 4.0))
+                wait_s = min(1.5 * attempt, 4.0)
+                if attempt < attempts and _has_budget_for_retry(wait_s):
+                    _refresh_lease_before_retry()
+                    time.sleep(wait_s)
                     continue
                 raise last_exc
 
@@ -404,7 +443,8 @@ class GroqChatModel(BaseChatModel):
                     retryable=True,
                     status_code=resp.status_code,
                 )
-                if attempt < attempts and wait_s <= 12.0:
+                if attempt < attempts and wait_s <= 12.0 and _has_budget_for_retry(wait_s):
+                    _refresh_lease_before_retry()
                     time.sleep(wait_s)
                     continue
                 raise last_exc
@@ -416,8 +456,10 @@ class GroqChatModel(BaseChatModel):
                     retryable=True,
                     status_code=resp.status_code,
                 )
-                if attempt < attempts:
-                    time.sleep(min(2.0 * attempt, 5.0))
+                wait_s = min(2.0 * attempt, 5.0)
+                if attempt < attempts and _has_budget_for_retry(wait_s):
+                    _refresh_lease_before_retry()
+                    time.sleep(wait_s)
                     continue
                 raise last_exc
 
@@ -428,7 +470,8 @@ class GroqChatModel(BaseChatModel):
                     retryable=True,
                     status_code=resp.status_code,
                 )
-                if attempt < attempts:
+                if attempt < attempts and _has_budget_for_retry(0.0):
+                    _refresh_lease_before_retry()
                     # Add a transient system reminder so the next attempt uses only registered tools.
                     payload["messages"] = [
                         *payload["messages"],
@@ -460,6 +503,7 @@ def create_groq_chat_model(
     registry: Optional[ToolRegistry] = None,
     bind_default_tools: bool = True,
     http_client: Optional[httpx.Client] = None,
+    heartbeat_callback: Optional[Callable[[], Any]] = None,
 ) -> Runnable[Any, AIMessage]:
     """Create a fresh per-run `GroqChatModel` configured from environment `Settings`."""
     cfg = settings or get_settings()
@@ -470,6 +514,7 @@ def create_groq_chat_model(
         timeout_seconds=float(cfg.agent_model_timeout_seconds),
         max_http_retries=cfg.agent_max_retries,
         http_client=http_client,
+        heartbeat_callback=heartbeat_callback,
     )
     if bind_default_tools:
         tool_schemas = build_openai_tool_schemas(registry)
